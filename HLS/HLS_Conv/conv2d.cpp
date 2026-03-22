@@ -38,26 +38,56 @@ void Conv2D_HW(TFXP *input, TFXP * output, TFXP * filters, TFXP * biases,
 #pragma HLS INTERFACE s_axilite port=relu
 #pragma HLS INTERFACE s_axilite port=return
 
+  // Local BRAM buffers
+  TFXP localFilters[256 * 3 * 3]; // Max: 256 channels x 3x3 kernel
+  TFXP rowBuffer[3][4096];        // 3 row buffers, max numChannels * inputWidth = 32*128 = 4096
+
   for (uint32_t iFilter = 0; iFilter < numFilters; ++ iFilter) {
     TFXP bias = biases[iFilter];
 
     // Cache filter coefficients for this filter into local BRAM
-    TFXP localFilters[256 * 3 * 3]; // Max: 256 channels x 3x3 kernel
     for (uint32_t i = 0; i < numChannels * convHeight * convWidth; ++ i) {
 #pragma HLS PIPELINE II=1
       localFilters[i] = *(filters + iFilter*numChannels*convHeight*convWidth + i);
     }
 
+    // Load initial 3 rows into BRAM buffers
+    for (uint32_t row = 0; row < 3; ++ row) {
+#pragma HLS LOOP_FLATTEN off
+      for (uint32_t ch = 0; ch < numChannels; ++ ch) {
+#pragma HLS LOOP_FLATTEN off
+        uint32_t srcBase = ch * inputWidth * inputHeight + row * inputWidth;
+        uint32_t dstBase = ch * inputWidth;
+        for (uint32_t px = 0; px < inputWidth; ++ px) {
+#pragma HLS PIPELINE II=1
+          rowBuffer[row][dstBase + px] = *(input + srcBase + px);
+        }
+      }
+    }
+
     for (uint32_t y = 0; y < (inputHeight-2); ++y) {
+      // For y > 0, load the new row (y+2) into the buffer that held the expired row (y-1)
+      if (y > 0) {
+        uint32_t newRow = y + 2;
+        uint32_t bufIdx = newRow % 3;
+        for (uint32_t ch = 0; ch < numChannels; ++ ch) {
+#pragma HLS LOOP_FLATTEN off
+          uint32_t srcBase = ch * inputWidth * inputHeight + newRow * inputWidth;
+          uint32_t dstBase = ch * inputWidth;
+          for (uint32_t px = 0; px < inputWidth; ++ px) {
+#pragma HLS PIPELINE II=1
+            rowBuffer[bufIdx][dstBase + px] = *(input + srcBase + px);
+          }
+        }
+      }
+
       for (uint32_t x = 0; x < (inputWidth-2); ++ x) {
-        TFXP acc;
-        acc = 0;
+        TFXP acc = 0;
         for (uint32_t iChannel = 0; iChannel < numChannels; ++ iChannel) {
           for (uint32_t cy = 0; cy < convHeight; ++ cy) {
             for (uint32_t cx = 0; cx < convWidth; ++cx) {
-              TFXP pixelValue, filterValue;
-              filterValue = localFilters[iChannel*convHeight*convWidth + cy*convWidth + cx];
-              pixelValue = *(input + iChannel*inputWidth*inputHeight + (y+cy)*inputWidth + (x+cx));
+              TFXP filterValue = localFilters[iChannel*convHeight*convWidth + cy*convWidth + cx];
+              TFXP pixelValue = rowBuffer[(y + cy) % 3][iChannel * inputWidth + x + cx];
               acc += FXP_Mult(filterValue, pixelValue, DECIMALS);
             }
           }
@@ -68,7 +98,6 @@ void Conv2D_HW(TFXP *input, TFXP * output, TFXP * filters, TFXP * biases,
         if (relu) {
           acc = (acc < 0) ? 0 : acc;
         }
-        //output[iFilter][y][x] = acc;
         *(output + iFilter * (inputHeight-2)*(inputWidth-2) + y*(inputWidth-2) + x) = acc;
       }
     }

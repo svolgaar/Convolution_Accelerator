@@ -8,6 +8,8 @@ Midterm project for the Class HW-SW Codesign on using an PYNQ FPGA board to acce
 | SW                | 256   | 256    | 16       | 32      | 28000     | n/a        | n/a        | n/a   | n/a      |
 | Initial solution  | 256   | 256    | 16       | 32      | 86357     | 5316 (9%)  | 5838 (5%)  | -     | 39 (17%) |
 | + Dual AXI + Interface tuning + Filter caching | 256 | 256 | 16 | 32 | 14124 | 9180 (17%) | 5977 (5%) | 8 (2%) | 30 (13%) |
+| + Input row caching | 256 | 256 | 16 | 32 | 12870 | 10369 (19%) | 6494 (6%) | 40 (14%) | 15 (6%) |
+| + memcpy burst transfers (reverted) | 256 | 256 | 16 | 32 | 12856 | 13167 (24%) | 10744 (10%) | 48 (17%) | 45 (20%) |
 
 ## 1. Basic Accelerator Design and Integration
 
@@ -309,3 +311,99 @@ Total Dense time (SW):148983929 ns (0.149 s) 1.1 %
 Total Flatten time:   453419 ns (0.000 s) 0.0 %
 Total Sigmoid time:   4170674 ns (0.004 s) 0.0 %
 Total time:           14123941545 ns (14.124 s) 100.0 %
+
+
+## 3. Input Row Caching
+
+### Problem
+In the previous implementation, input pixels are read directly from DDR for every multiply-accumulate operation. With a 3x3 convolution kernel, each input row is read 3 times (once for each kernel row) across consecutive output rows. This results in `3 * numChannels * inputWidth` redundant DDR reads per output row.
+
+### Solution
+Cache 3 rows of input data (across all channels) into local BRAM using a circular buffer scheme. Since a 3x3 convolution only needs 3 consecutive rows at any time, we maintain `rowBuffer[3][4096]` — 3 row slots, each holding up to `numChannels * inputWidth` pixels (max 32 * 128 = 4096 for the model's layers).
+
+```cpp
+TFXP rowBuffer[3][4096];
+
+// Load initial 3 rows into BRAM
+for (uint32_t row = 0; row < 3; ++ row) {
+    for (uint32_t ch = 0; ch < numChannels; ++ ch) {
+        uint32_t srcBase = ch * inputWidth * inputHeight + row * inputWidth;
+        uint32_t dstBase = ch * inputWidth;
+        for (uint32_t px = 0; px < inputWidth; ++ px)
+            rowBuffer[row][dstBase + px] = *(input + srcBase + px);
+    }
+}
+
+// Sliding window: for each new output row y, replace the expired row with row y+2
+for (uint32_t y = 0; y < (inputHeight-2); ++y) {
+    if (y > 0) {
+        uint32_t newRow = y + 2;
+        uint32_t bufIdx = newRow % 3;  // circular index
+        // Load new row into the slot that held the expired row
+        ...
+    }
+    // Convolution reads from rowBuffer[(y+cy) % 3] instead of DDR
+}
+```
+
+The circular indexing `(y + cy) % 3` maps each of the 3 kernel rows to the correct buffer slot. When moving to the next output row, only 1 new row is loaded from DDR (replacing the row that's no longer needed), instead of re-reading all 3 rows.
+
+### Impact
+- **DDR input reads**: Reduced from `3 * numChannels * inputWidth * outputHeight` per filter to `(outputHeight + 2) * numChannels * inputWidth` — each row is read exactly once from DDR
+- **BRAM usage**: 8 (2%) → 40 (14%) — 32 additional BRAM18K for the 3 row buffers (3 x 4096 x 32-bit = 48KB)
+- **DSPs**: 30 (13%) → 15 (6%) — reduced because filter reads now come from local BRAM, allowing HLS to simplify address computation
+- **Runtime**: 14.1s → 12.9s (~9% improvement) — modest gain because the DDR access pattern (non-sequential across channels) still limits burst efficiency
+
+Runtime HW with input row caching:
+
+xilinx@pynq:~/dogs_cats$ sudo ./cnnSolver dog.9499.jpg.rgba.planar
+[HW] Opening Conv2D accelerator at 0x40000000...
+[HW] Accelerator opened successfully.
+[HW] Allocating DMA-compatible buffers...
+[HW] DMA buffers allocated.
+[HW] Running inference with Conv2D accelerator...
+[HW] OUTPUT: 0.93905449 --> DOG
+Conv 0 (HW) --> 1603014382 ns (1.603 s)
+Conv 1 (HW) --> 3785198973 ns (3.785 s)
+Conv 2 (HW) --> 3389254887 ns (3.389 s)
+Conv 3 (HW) --> 3101344060 ns (3.101 s)
+Conv 4 (HW) --> 337042289 ns (0.337 s)
+MaxPool 0 --> 292605120 ns (0.293 s)
+MaxPool 1 --> 125775966 ns (0.126 s)
+MaxPool 2 --> 58864283 ns (0.059 s)
+MaxPool 3 --> 25611006 ns (0.026 s)
+MaxPool 4 --> 1187483 ns (0.001 s)
+Dense 5 (SW) --> 148974616 ns (0.149 s)
+Dense 6 (SW) --> 67631 ns (0.000 s)
+Total Conv time (HW): 12215854591 ns (12.216 s) 94.9 %
+Total MaxPool time:   504043858 ns (0.504 s) 3.9 %
+Total Dense time (SW):149042247 ns (0.149 s) 1.2 %
+Total Flatten time:   452444 ns (0.000 s) 0.0 %
+Total Sigmoid time:   116160 ns (0.000 s) 0.0 %
+Total time:           12869509300 ns (12.870 s) 100.0 %
+
+
+## 4. Burst Transfer Optimization via memcpy (Attempted — Reverted)
+
+### Motivation
+HLS reported "Stride is incompatible" and "Could not widen" warnings on all DDR data transfers, indicating that manual pointer-arithmetic loops were being compiled as single-element AXI transactions rather than bursts. The idea was to replace these loops with `memcpy`, which HLS has built-in recognition for and directly maps to AXI burst transactions.
+
+### Changes Attempted
+- **Filter loading**: replaced manual copy loop with `memcpy(localFilters, filters + offset, size)`
+- **Row loading**: replaced inner pixel loop with `memcpy(rowBuffer[row] + dst, input + src, inputWidth * sizeof(TFXP))`
+- **Output writing**: buffered output row in BRAM (`outputRow[x] = acc`), then burst-wrote with `memcpy(output + offset, outputRow, outputWidth * sizeof(TFXP))`
+
+### Results
+The `memcpy` approach resolved the "Could not widen" warnings but the "Stride is incompatible" warnings persisted on the outer loops (unavoidable with CHW data layout — channels are non-contiguous in memory).
+
+More importantly, **runtime was unchanged**: 12.870s → 12.856s. The bottleneck is the convolution compute loop (multiply-accumulate across channels/kernel), not the data transfer overhead. The transfers (row loading, filter loading, output writing) represent a negligible fraction of the total execution time.
+
+### Resource Cost
+The burst logic came at significant resource cost for zero performance benefit:
+- **BRAM**: 40 (14%) → 48 (17%)
+- **DSPs**: 15 (6%) → 45 (20%)
+- **LUTs**: 10369 (19%) → 13167 (24%)
+- **FFs**: 6494 (6%) → 10744 (10%)
+
+### Decision
+Reverted to the manual loop version to preserve resources for potential compute-side optimizations (loop unrolling, pipelining) that would target the actual bottleneck.
