@@ -10,6 +10,7 @@ Midterm project for the Class HW-SW Codesign on using an PYNQ FPGA board to acce
 | + Dual AXI + Interface tuning + Filter caching | 256 | 256 | 16 | 32 | 14124 | 9180 (17%) | 5977 (5%) | 8 (2%) | 30 (13%) |
 | + Input row caching | 256 | 256 | 16 | 32 | 12870 | 10369 (19%) | 6494 (6%) | 40 (14%) | 15 (6%) |
 | + memcpy burst transfers (reverted) | 256 | 256 | 16 | 32 | 12856 | 13167 (24%) | 10744 (10%) | 48 (17%) | 45 (20%) |
+| + 4x filter parallelism | 256 | 256 | 16 | 32 | 4853 | 15986 (30%) | 12978 (12%) | 64 (22%) | 66 (30%) |
 
 ## 1. Basic Accelerator Design and Integration
 
@@ -407,3 +408,86 @@ The burst logic came at significant resource cost for zero performance benefit:
 
 ### Decision
 Reverted to the manual loop version to preserve resources for potential compute-side optimizations (loop unrolling, pipelining) that would target the actual bottleneck.
+
+
+## 5. Parallelizing Output Filter Computation (N_PARALLEL=4)
+
+### Problem
+After the memcpy experiment proved the design is compute-bound, the bottleneck is clear: the convolution MAC loop iterates over all `numChannels * 3 * 3` multiply-accumulates for every output pixel, and this is repeated for every output filter sequentially. For layer 1 (64 filters, 32 channels), that's 64 full spatial passes over the input.
+
+### Solution
+Compute multiple output filters simultaneously by replicating the filter storage, multipliers, and accumulators. All parallel filters share the same input pixel (read once from `rowBuffer`), so input caching is unchanged.
+
+Key changes:
+- **`localFilters[4][256*9]`** — 4 separate BRAM arrays, one per parallel filter, fully partitioned on the first dimension so all 4 can be read in the same cycle:
+```cpp
+TFXP localFilters[4][256 * 3 * 3];
+#pragma HLS ARRAY_PARTITION variable=localFilters complete dim=1
+```
+
+- **Outer loop** steps by `N_PARALLEL=4`:
+```cpp
+for (uint32_t iFilter = 0; iFilter < numFilters; iFilter += N_PARALLEL) {
+```
+
+- **Inner MAC** reads one pixel, multiplies against all 4 filters in parallel:
+```cpp
+TFXP pixelValue = rowBuffer[(y + cy) % 3][iChannel * inputWidth + x + cx];
+for (uint32_t p = 0; p < N_PARALLEL; ++p) {
+#pragma HLS UNROLL
+    TFXP filterValue = localFilters[p][iChannel*convHeight*convWidth + cy*convWidth + cx];
+    acc[p] += FXP_Mult(filterValue, pixelValue, DECIMALS);
+}
+```
+
+- **4 independent accumulators** with separate bias addition, ReLU, and output writes, all unrolled
+- **Edge case handling**: `nActive` tracks valid filters when `numFilters % 4 != 0`; bounds-checked before output writes
+
+### Impact
+- **Conv time**: 12.2s → 4.2s (**2.9x speedup**, close to theoretical 4x)
+- **Total time**: 12.9s → 4.9s (**2.6x overall speedup**)
+- **BRAM**: 40 (14%) → 64 (22%) — 4 separate filter BRAMs
+- **DSPs**: 15 (6%) → 66 (30%) — 4x multipliers for parallel MACs
+- **LUTs**: 10369 (19%) → 15986 (30%) — parallel control logic
+- **FFs**: 6494 (6%) → 12978 (12%) — parallel pipeline registers
+- The gap from ideal 4x speedup comes from filter loading overhead (4 filters loaded sequentially per group)
+
+### Per-layer breakdown
+
+| Layer | Channels | Filters | Before (s) | After (s) | Speedup |
+|-------|----------|---------|------------|-----------|---------|
+| Conv 0 | 3 | 32 | 1.603 | 1.046 | 1.5x |
+| Conv 1 | 32 | 64 | 3.785 | 1.259 | 3.0x |
+| Conv 2 | 64 | 128 | 3.389 | 0.991 | 3.4x |
+| Conv 3 | 128 | 256 | 3.101 | 0.841 | 3.7x |
+| Conv 4 | 256 | 64 | 0.337 | 0.088 | 3.8x |
+
+Layers with more filters see greater speedup (closer to 4x) because the filter loading overhead is amortized over more spatial computation. Layer 0 (only 3 input channels, 32 filters) benefits least because the computation per filter is small relative to the loading cost.
+
+Runtime HW with 4x filter parallelism:
+
+xilinx@pynq:~/dogs_cats$ sudo ./cnnSolver dog.9499.jpg.rgba.planar
+[HW] Opening Conv2D accelerator at 0x40000000...
+[HW] Accelerator opened successfully.
+[HW] Allocating DMA-compatible buffers...
+[HW] DMA buffers allocated.
+[HW] Running inference with Conv2D accelerator...
+[HW] OUTPUT: 0.93905449 --> DOG
+Conv 0 (HW) --> 1046209380 ns (1.046 s)
+Conv 1 (HW) --> 1259167571 ns (1.259 s)
+Conv 2 (HW) --> 991472220 ns (0.991 s)
+Conv 3 (HW) --> 840652122 ns (0.841 s)
+Conv 4 (HW) --> 88236292 ns (0.088 s)
+MaxPool 0 --> 266050701 ns (0.266 s)
+MaxPool 1 --> 125661812 ns (0.126 s)
+MaxPool 2 --> 58855582 ns (0.059 s)
+MaxPool 3 --> 25663336 ns (0.026 s)
+MaxPool 4 --> 1187606 ns (0.001 s)
+Dense 5 (SW) --> 148925228 ns (0.149 s)
+Dense 6 (SW) --> 66003 ns (0.000 s)
+Total Conv time (HW): 4225737585 ns (4.226 s) 87.1 %
+Total MaxPool time:   477419037 ns (0.477 s) 9.8 %
+Total Dense time (SW):148991231 ns (0.149 s) 3.1 %
+Total Flatten time:   450341 ns (0.000 s) 0.0 %
+Total Sigmoid time:   174504 ns (0.000 s) 0.0 %
+Total time:           4852772698 ns (4.853 s) 100.0 %
