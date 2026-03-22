@@ -21,10 +21,10 @@ void Conv2D_HW(TFXP *input, TFXP * output, TFXP * filters, TFXP * biases,
       uint32_t convWidth, uint32_t convHeight,
       uint32_t relu)
 {
-#pragma HLS INTERFACE m_axi port=input bundle=master1 offset=slave
-#pragma HLS INTERFACE m_axi port=output bundle=master1 offset=slave
-#pragma HLS INTERFACE m_axi port=filters bundle=master1 offset=slave
-#pragma HLS INTERFACE m_axi port=biases bundle=master1 offset=slave
+#pragma HLS INTERFACE m_axi port=input bundle=master1 offset=slave depth=196608 max_read_burst_length=256 num_read_outstanding=16 latency=20
+#pragma HLS INTERFACE m_axi port=output bundle=master1 offset=slave depth=2064512 max_write_burst_length=256 num_write_outstanding=16 latency=20
+#pragma HLS INTERFACE m_axi port=filters bundle=master2 offset=slave depth=27648 max_read_burst_length=256 num_read_outstanding=16 latency=20
+#pragma HLS INTERFACE m_axi port=biases bundle=master2 offset=slave depth=256 max_read_burst_length=256 num_read_outstanding=16 latency=20
 #pragma HLS INTERFACE s_axilite port=input
 #pragma HLS INTERFACE s_axilite port=output
 #pragma HLS INTERFACE s_axilite port=filters
@@ -40,6 +40,14 @@ void Conv2D_HW(TFXP *input, TFXP * output, TFXP * filters, TFXP * biases,
 
   for (uint32_t iFilter = 0; iFilter < numFilters; ++ iFilter) {
     TFXP bias = biases[iFilter];
+
+    // Cache filter coefficients for this filter into local BRAM
+    TFXP localFilters[256 * 3 * 3]; // Max: 256 channels x 3x3 kernel
+    for (uint32_t i = 0; i < numChannels * convHeight * convWidth; ++ i) {
+#pragma HLS PIPELINE II=1
+      localFilters[i] = *(filters + iFilter*numChannels*convHeight*convWidth + i);
+    }
+
     for (uint32_t y = 0; y < (inputHeight-2); ++y) {
       for (uint32_t x = 0; x < (inputWidth-2); ++ x) {
         TFXP acc;
@@ -47,9 +55,8 @@ void Conv2D_HW(TFXP *input, TFXP * output, TFXP * filters, TFXP * biases,
         for (uint32_t iChannel = 0; iChannel < numChannels; ++ iChannel) {
           for (uint32_t cy = 0; cy < convHeight; ++ cy) {
             for (uint32_t cx = 0; cx < convWidth; ++cx) {
-              //acc += filters[iFilter][iChannel][cy][cx] * input[iChannel][y+cy][x+cx];
               TFXP pixelValue, filterValue;
-              filterValue = *(filters + iFilter*numChannels*convHeight*convWidth + iChannel*convHeight*convWidth + cy*convWidth + cx);
+              filterValue = localFilters[iChannel*convHeight*convWidth + cy*convWidth + cx];
               pixelValue = *(input + iChannel*inputWidth*inputHeight + (y+cy)*inputWidth + (x+cx));
               acc += FXP_Mult(filterValue, pixelValue, DECIMALS);
             }

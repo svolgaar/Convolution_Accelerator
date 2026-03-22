@@ -34,6 +34,11 @@ ip: IP-repo/$(PROJECT_NAME).zip $(HLS_SRC)/conv2d.cpp $(HLS_SRC)/conv2d.h
 IP-repo/$(PROJECT_NAME).zip: $(HLS_SRC)/conv2d.cpp $(HLS_SRC)/conv2d.h
 	rm -rf $(PROJECT_NAME)_HLS
 	vitis_hls -f $(HLS_SCRIPTS)/$(PROJECT_NAME)_HLS_impl.tcl
+	@echo ""
+	@echo "========================================"
+	@echo "== HLS Synthesis Report"
+	@echo "========================================"
+	@cat $(PROJECT_NAME)_HLS/solution1/syn/report/csynth.rpt
 
 hls_project: $(PROJECT_NAME)_HLS/hls.app
 
