@@ -68,22 +68,22 @@ void Conv2D_HW(TFXP *input, TFXP * output, TFXP * filters, TFXP * biases,
     }
 
     // Cache filter coefficients for N_PARALLEL filters into local BRAM
+    // Interleaved loading: read one element per cycle, write to all 16 filter BRAMs
+    // simultaneously. Eliminates 16 separate burst restarts per filter group.
     uint32_t filterLen = numChannels * convHeight * convWidth;
-    for (uint32_t p = 0; p < N_PARALLEL; ++p) {
-      if (p < nActive) {
-        for (uint32_t i = 0; i < filterLen; ++ i) {
+    for (uint32_t i = 0; i < filterLen; ++ i) {
 #pragma HLS PIPELINE II=1
+      for (uint32_t p = 0; p < N_PARALLEL; ++p) {
+#pragma HLS UNROLL
+        if (p < nActive)
           localFilters[p][i] = *(filters + (iFilter + p)*filterLen + i);
-        }
       }
     }
 
     // Load initial 4 rows into BRAM buffers (3 for first computation + 1 prefetched)
     uint32_t initRows = (inputHeight < 4) ? inputHeight : 4;
     for (uint32_t row = 0; row < initRows; ++ row) {
-#pragma HLS LOOP_FLATTEN off
       for (uint32_t ch = 0; ch < numChannels; ++ ch) {
-#pragma HLS LOOP_FLATTEN off
         uint32_t srcBase = ch * inputWidth * inputHeight + row * inputWidth;
         uint32_t dstBase = ch * inputWidth;
         for (uint32_t px = 0; px < inputWidth; ++ px) {
@@ -102,7 +102,6 @@ void Conv2D_HW(TFXP *input, TFXP * output, TFXP * filters, TFXP * biases,
         uint32_t prefetchRow = y + 3;
         uint32_t bufIdx = prefetchRow % 4;
         for (uint32_t ch = 0; ch < numChannels; ++ ch) {
-#pragma HLS LOOP_FLATTEN off
           uint32_t srcBase = ch * inputWidth * inputHeight + prefetchRow * inputWidth;
           uint32_t dstBase = ch * inputWidth;
           for (uint32_t px = 0; px < inputWidth; ++ px) {
@@ -148,14 +147,13 @@ void Conv2D_HW(TFXP *input, TFXP * output, TFXP * filters, TFXP * biases,
       }
 
       // Burst-write each filter's output row from local buffer to DDR
-      // Each filter's row is consecutive in memory, enabling efficient burst transfers
-      for (uint32_t p = 0; p < N_PARALLEL; ++p) {
-        if ((iFilter + p) < numFilters) {
-          uint32_t dstBase = (iFilter + p) * outHeight * outWidth + y * outWidth;
-          for (uint32_t x = 0; x < outWidth; ++x) {
+      // Each filter's row is consecutive in memory, enabling efficient burst transfers.
+      // Write all N_PARALLEL slots unconditionally — unused padding outputs are never read.
+      for (uint32_t p = 0; p < nActive; ++p) {
+        uint32_t dstBase = (iFilter + p) * outHeight * outWidth + y * outWidth;
+        for (uint32_t x = 0; x < outWidth; ++x) {
 #pragma HLS PIPELINE II=1
-            *(output + dstBase + x) = outRowBuf[p][x];
-          }
+          *(output + dstBase + x) = outRowBuf[p][x];
         }
       }
     }

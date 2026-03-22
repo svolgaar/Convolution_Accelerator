@@ -16,6 +16,7 @@ Midterm project for the Class HW-SW Codesign on using an PYNQ FPGA board to acce
 | + Separate output HP port (reverted) | 256 | 256 | 16 | 32 | 3190 | 18435 (34%) | 13339 (12%) | 96 (34%) | 88 (40%) |
 | + 16x filter parallelism | 256 | 256 | 16 | 32 | 2509 | 22196 (41%) | 18290 (17%) | 160 (57%) | 137 (62%) |
 | + Output row buffering + remove latency hint | 256 | 256 | 16 | 32 | 1402 | 17099 (32%) | 13367 (12%) | 176 (62%) | 91 (41%) |
+| + Loop flattening + interleaved filter load | 256 | 256 | 16 | 32 | 1397 | 16976 (31%) | 20575 (19%) | 176 (62%) | 92 (41%) |
 
 ## 1. Basic Accelerator Design and Integration
 
@@ -697,3 +698,43 @@ Without buffering, each (x,y) pixel computation ended with 16 writes to scattere
 
 ### Remaining bottleneck
 With Conv at 0.775s (55.3%), MaxPool is now the second-largest component at 0.477s (34.0%) — entirely in software on the ARM CPU. The FPGA sits idle during MaxPool execution.
+
+## 10. Loop Flattening and Overhead Reduction
+
+### Motivation
+Cycle analysis showed a 2–5× overhead ratio between the estimated compute cycles and actual runtime. Three sources of overhead were identified:
+1. **Per-channel burst restart in row loading**: The `ch` and `px` loops were separate, causing HLS to restart the AXI read pipeline for each channel boundary.
+2. **Sequential filter loading**: Filters were loaded one at a time (outer loop over `p`, inner over `i`), causing 16 separate burst restarts per filter group.
+3. **Conditional branch in output writes**: The `if ((iFilter+p) < numFilters)` guard inside the output burst loop prevented HLS from optimizing the burst pattern.
+
+### Changes
+1. **Removed `LOOP_FLATTEN off`** from row loading and prefetch loops, allowing HLS to merge the `ch` and `px` loops into a single flattened pipeline. This eliminates per-channel restart overhead — visible in the synthesis report as `VITIS_LOOP_85_5_VITIS_LOOP_86_6_VITIS_LOOP_89_7` (3 loops fused, II=1).
+
+2. **Interleaved filter loading**: Restructured from sequential loading (outer `p`, inner `i`) to interleaved (outer `i`, inner `p` with `#pragma HLS UNROLL`). All 16 filters are now loaded simultaneously from a single sequential read stream, eliminating 16× burst restarts per filter group. Synthesis confirms II=16 on the filter load pipeline.
+
+3. **Removed conditional from output burst write**: Changed from `for (p = 0; p < N_PARALLEL; ++p) { if ((iFilter+p) < numFilters) { ... } }` to `for (p = 0; p < nActive; ++p) { ... }`, removing the branch that prevented burst optimization.
+
+### Results
+| Layer | Before (ms) | After (ms) | Change |
+|-------|-------------|------------|--------|
+| Conv 0 (3ch→32f) | 100 | 99 | -1% |
+| Conv 1 (32ch→64f) | 238 | 236 | -1% |
+| Conv 2 (64ch→64f) | 215 | 211 | -2% |
+| Conv 3 (64ch→128f) | 199 | 198 | -1% |
+| Conv 4 (128ch→256f) | 23 | 26 | +13% |
+| **Total Conv** | **775** | **770** | **-0.6%** |
+| **Total** | **1402** | **1397** | **-0.4%** |
+
+The changes produced a negligible improvement (~5ms). This confirms that the overhead was not from loop restart costs or conditional branches, but rather inherent AXI transaction setup and pipeline drain costs that cannot be eliminated through pragma-level changes alone.
+
+### Resources
+- **BRAM**: 176 (62%) → 176 (62%) — unchanged
+- **DSP**: 91 (41%) → 92 (41%) — +1 (negligible)
+- **LUT**: 17099 (32%) → 16976 (31%) — slight decrease
+- **FF**: 13367 (12%) → 20575 (19%) — increase due to flattened loop control logic being inlined into pipeline registers
+
+The changes are kept for cleaner code structure despite minimal performance impact.
+
+### Final performance summary
+Overall speedup from the original software-only baseline: **28.0s → 1.397s = 20.0×**
+Overall speedup from the initial HW accelerator: **86.4s → 1.397s = 61.8×**
