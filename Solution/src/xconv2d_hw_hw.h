@@ -29,27 +29,33 @@
 // 0x18 : Data signal of output_r
 //        bit 31~0 - output_r[31:0] (Read/Write)
 // 0x1c : reserved
-// 0x20 : Data signal of coeffs
-//        bit 31~0 - coeffs[31:0] (Read/Write)
+// 0x20 : Data signal of filters
+//        bit 31~0 - filters[31:0] (Read/Write)
 // 0x24 : reserved
-// 0x28 : Data signal of numChannels
-//        bit 31~0 - numChannels[31:0] (Read/Write)
+// 0x28 : Data signal of biases
+//        bit 31~0 - biases[31:0] (Read/Write)
 // 0x2c : reserved
-// 0x30 : Data signal of numFilters
-//        bit 31~0 - numFilters[31:0] (Read/Write)
+// 0x30 : Data signal of numChannels
+//        bit 31~0 - numChannels[31:0] (Read/Write)
 // 0x34 : reserved
-// 0x38 : Data signal of inputWidth
-//        bit 31~0 - inputWidth[31:0] (Read/Write)
+// 0x38 : Data signal of numFilters
+//        bit 31~0 - numFilters[31:0] (Read/Write)
 // 0x3c : reserved
-// 0x40 : Data signal of inputHeight
-//        bit 31~0 - inputHeight[31:0] (Read/Write)
+// 0x40 : Data signal of inputWidth
+//        bit 31~0 - inputWidth[31:0] (Read/Write)
 // 0x44 : reserved
-// 0x48 : Data signal of convWidth
-//        bit 31~0 - convWidth[31:0] (Read/Write)
+// 0x48 : Data signal of inputHeight
+//        bit 31~0 - inputHeight[31:0] (Read/Write)
 // 0x4c : reserved
-// 0x50 : Data signal of convHeight
-//        bit 31~0 - convHeight[31:0] (Read/Write)
+// 0x50 : Data signal of convWidth
+//        bit 31~0 - convWidth[31:0] (Read/Write)
 // 0x54 : reserved
+// 0x58 : Data signal of convHeight
+//        bit 31~0 - convHeight[31:0] (Read/Write)
+// 0x5c : reserved
+// 0x60 : Data signal of relu
+//        bit 31~0 - relu[31:0] (Read/Write)
+// 0x64 : reserved
 // (SC = Self Clear, COR = Clear on Read, TOW = Toggle on Write, COH = Clear on Handshake)
 
 #define XCONV2D_HW_CONTROL_ADDR_AP_CTRL          0x00
@@ -60,18 +66,22 @@
 #define XCONV2D_HW_CONTROL_BITS_INPUT_R_DATA     32
 #define XCONV2D_HW_CONTROL_ADDR_OUTPUT_R_DATA    0x18
 #define XCONV2D_HW_CONTROL_BITS_OUTPUT_R_DATA    32
-#define XCONV2D_HW_CONTROL_ADDR_COEFFS_DATA      0x20
-#define XCONV2D_HW_CONTROL_BITS_COEFFS_DATA      32
-#define XCONV2D_HW_CONTROL_ADDR_NUMCHANNELS_DATA 0x28
+#define XCONV2D_HW_CONTROL_ADDR_FILTERS_DATA     0x20
+#define XCONV2D_HW_CONTROL_BITS_FILTERS_DATA     32
+#define XCONV2D_HW_CONTROL_ADDR_BIASES_DATA      0x28
+#define XCONV2D_HW_CONTROL_BITS_BIASES_DATA      32
+#define XCONV2D_HW_CONTROL_ADDR_NUMCHANNELS_DATA 0x30
 #define XCONV2D_HW_CONTROL_BITS_NUMCHANNELS_DATA 32
-#define XCONV2D_HW_CONTROL_ADDR_NUMFILTERS_DATA  0x30
+#define XCONV2D_HW_CONTROL_ADDR_NUMFILTERS_DATA  0x38
 #define XCONV2D_HW_CONTROL_BITS_NUMFILTERS_DATA  32
-#define XCONV2D_HW_CONTROL_ADDR_INPUTWIDTH_DATA  0x38
+#define XCONV2D_HW_CONTROL_ADDR_INPUTWIDTH_DATA  0x40
 #define XCONV2D_HW_CONTROL_BITS_INPUTWIDTH_DATA  32
-#define XCONV2D_HW_CONTROL_ADDR_INPUTHEIGHT_DATA 0x40
+#define XCONV2D_HW_CONTROL_ADDR_INPUTHEIGHT_DATA 0x48
 #define XCONV2D_HW_CONTROL_BITS_INPUTHEIGHT_DATA 32
-#define XCONV2D_HW_CONTROL_ADDR_CONVWIDTH_DATA   0x48
+#define XCONV2D_HW_CONTROL_ADDR_CONVWIDTH_DATA   0x50
 #define XCONV2D_HW_CONTROL_BITS_CONVWIDTH_DATA   32
-#define XCONV2D_HW_CONTROL_ADDR_CONVHEIGHT_DATA  0x50
+#define XCONV2D_HW_CONTROL_ADDR_CONVHEIGHT_DATA  0x58
 #define XCONV2D_HW_CONTROL_BITS_CONVHEIGHT_DATA  32
+#define XCONV2D_HW_CONTROL_ADDR_RELU_DATA        0x60
+#define XCONV2D_HW_CONTROL_BITS_RELU_DATA        32
 

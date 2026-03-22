@@ -6,8 +6,8 @@ Midterm project for the Class HW-SW Codesign on using an PYNQ FPGA board to acce
 | Description       | Width | Height | Channels | Filters | Time (ms) | LUTs       | FFs        | BRAMs | DSPs     |
 |-------------------|-------|--------|----------|---------|-----------|------------|------------|-------|----------|
 | SW                | 256   | 256    | 16       | 32      | 28000     | n/a        | n/a        | n/a   | n/a      |
-| Initial solution  | 256   | 256    | 16       | 32      | 84563     | 5316 (9%)  | 5838 (5%)  | -     | 39 (17%) |
-| + Dual AXI + Interface tuning + Filter caching | 256 | 256 | 16 | 32 | 12945 | 9180 (17%) | 5977 (5%) | 8 (2%) | 30 (13%) |
+| Initial solution  | 256   | 256    | 16       | 32      | 86357     | 5316 (9%)  | 5838 (5%)  | -     | 39 (17%) |
+| + Dual AXI + Interface tuning + Filter caching | 256 | 256 | 16 | 32 | 14124 | 9180 (17%) | 5977 (5%) | 8 (2%) | 30 (13%) |
 
 ## 1. Basic Accelerator Design and Integration
 
@@ -24,6 +24,24 @@ The SW side ([model.cpp](Solution/src/model.cpp)) calls `convolver.Conv2D_HW(...
 - **Sigmoid**: Final activation for the binary classifier
 
 This partitioning makes sense because the convolution is by far the most compute-intensive operation (O(filters x channels x height x width x 3 x 3)), while the other operations are either simpler or have different access patterns less suited to the accelerator.
+
+### Bug Fix: Swapped numChannels/numFilters in model.cpp
+
+The original Lab 3 code had a bug in [model.cpp](Solution/src/model.cpp) where `numChannels` and `numFilters` were swapped in every `Conv2D_HW` call. The HLS function signature is:
+
+```cpp
+Conv2D_HW(..., uint32_t numChannels, uint32_t numFilters, ...)
+```
+
+But the Inference function passed them as:
+```cpp
+convolver.Conv2D_HW(..., LayerShapes[iLayer][1], LayerShapes[iLayer][0], ...)
+//                       ↑ output_filters (32)   ↑ input_channels (3)
+```
+
+This sent `numChannels=32` and `numFilters=3` for layer 0, causing the HW to only compute 3 output feature maps (instead of 32) while reading 32 input channels (only 3 exist). The out-of-bounds input reads caused a **read transaction overflow** visible in the System ILA on `master1`, and the network produced incorrect classifications.
+
+The fix swaps the arguments to `LayerShapes[iLayer][0], LayerShapes[iLayer][1]` so that `numChannels` correctly receives the number of input channels and `numFilters` receives the number of output filters.
 
 ---
 
@@ -243,32 +261,28 @@ xilinx@pynq:~/dogs_cats$ sudo ./cnnSolver dog.9499.jpg.rgba.planar
 
 
 
+[HW] OUTPUT: 1.00000000 --> DOG
+Conv 0 (HW) --> 6451485652 ns (6.451 s)
+Conv 1 (HW) --> 28595199274 ns (28.595 s)
+Conv 2 (HW) --> 26019028789 ns (26.019 s)
+Conv 3 (HW) --> 22481711192 ns (22.482 s)
+Conv 4 (HW) --> 2061981388 ns (2.062 s)
+MaxPool 0 --> 266283501 ns (0.266 s)
+MaxPool 1 --> 125602621 ns (0.126 s)
+MaxPool 2 --> 58888221 ns (0.059 s)
+MaxPool 3 --> 25613461 ns (0.026 s)
+MaxPool 4 --> 1187723 ns (0.001 s)
+Dense 5 (SW) --> 269742129 ns (0.270 s)
+Dense 6 (SW) --> 114846 ns (0.000 s)
+Total Conv time (HW): 85609406295 ns (85.609 s) 99.1 %
+Total MaxPool time:   477575527 ns (0.478 s) 0.6 %
+Total Dense time (SW):269856975 ns (0.270 s) 0.3 %
+Total Flatten time:   433710 ns (0.000 s) 0.0 %
+Total Sigmoid time:   167345 ns (0.000 s) 0.0 %
+Total time:           86357439852 ns (86.357 s) 100.0 %
 
 
-
-
-[HW] OUTPUT: 0.00000000 --> CAT
-Conv 0 (HW) --> 5499389998 ns (5.499 s)
-Conv 1 (HW) --> 28145986263 ns (28.146 s)
-Conv 2 (HW) --> 25828306353 ns (25.828 s)
-Conv 3 (HW) --> 22380201595 ns (22.380 s)
-Conv 4 (HW) --> 2064445711 ns (2.064 s)
-MaxPool 0 --> 266146365 ns (0.266 s)
-MaxPool 1 --> 125632584 ns (0.126 s)
-MaxPool 2 --> 58880434 ns (0.059 s)
-MaxPool 3 --> 25615150 ns (0.026 s)
-MaxPool 4 --> 1365483 ns (0.001 s)
-Dense 5 (SW) --> 166148606 ns (0.166 s)
-Dense 6 (SW) --> 66117 ns (0.000 s)
-Total Conv time (HW): 83918329920 ns (83.918 s) 99.2 %
-Total MaxPool time:   477640016 ns (0.478 s) 0.6 %
-Total Dense time (SW):166214723 ns (0.166 s) 0.2 %
-Total Flatten time:   457166 ns (0.000 s) 0.0 %
-Total Sigmoid time:   169139 ns (0.000 s) 0.0 %
-Total time:           84562810964 ns (84.563 s) 100.0 %
-
-
-Runtime HW with filter cacheing and improved AXI port interfacing
+Runtime HW with filter caching and improved AXI port interfacing:
 
 xilinx@pynq:~/dogs_cats$ sudo ./cnnSolver dog.9499.jpg.rgba.planar
 [HW] Opening Conv2D accelerator at 0x40000000...
@@ -276,23 +290,22 @@ xilinx@pynq:~/dogs_cats$ sudo ./cnnSolver dog.9499.jpg.rgba.planar
 [HW] Allocating DMA-compatible buffers...
 [HW] DMA buffers allocated.
 [HW] Running inference with Conv2D accelerator...
-[HW] OUTPUT: 0.00000000 --> CAT
-Conv 0 (HW) --> 858073553 ns (0.858 s)
-Conv 1 (HW) --> 4182613227 ns (4.183 s)
-Conv 2 (HW) --> 3759668339 ns (3.760 s)
-Conv 3 (HW) --> 3222368220 ns (3.222 s)
-Conv 4 (HW) --> 295277190 ns (0.295 s)
-MaxPool 0 --> 266066550 ns (0.266 s)
-MaxPool 1 --> 125711341 ns (0.126 s)
-MaxPool 2 --> 58848483 ns (0.059 s)
-MaxPool 3 --> 25598252 ns (0.026 s)
-MaxPool 4 --> 1187157 ns (0.001 s)
-Dense 5 (SW) --> 148922705 ns (0.149 s)
-Dense 6 (SW) --> 65751 ns (0.000 s)
-Total Conv time (HW): 12318000529 ns (12.318 s) 95.2 %
-Total MaxPool time:   477411783 ns (0.477 s) 3.7 %
-Total Dense time (SW):148988456 ns (0.149 s) 1.2 %
-Total Flatten time:   451951 ns (0.000 s) 0.0 %
-Total Sigmoid time:   174865 ns (0.000 s) 0.0 %
-Total time:           12945027584 ns (12.945 s) 100.0 %
-xilinx@pynq:~/dogs_cats$ 
+[HW] OUTPUT: 0.93905449 --> DOG
+Conv 0 (HW) --> 1621222367 ns (1.621 s)
+Conv 1 (HW) --> 4432703446 ns (4.433 s)
+Conv 2 (HW) --> 3864081509 ns (3.864 s)
+Conv 3 (HW) --> 3265174196 ns (3.265 s)
+Conv 4 (HW) --> 283474200 ns (0.283 s)
+MaxPool 0 --> 267879206 ns (0.268 s)
+MaxPool 1 --> 127048018 ns (0.127 s)
+MaxPool 2 --> 81948759 ns (0.082 s)
+MaxPool 3 --> 25598735 ns (0.026 s)
+MaxPool 4 --> 1203087 ns (0.001 s)
+Dense 5 (SW) --> 148917806 ns (0.149 s)
+Dense 6 (SW) --> 66123 ns (0.000 s)
+Total Conv time (HW): 13466655718 ns (13.467 s) 95.3 %
+Total MaxPool time:   503677805 ns (0.504 s) 3.6 %
+Total Dense time (SW):148983929 ns (0.149 s) 1.1 %
+Total Flatten time:   453419 ns (0.000 s) 0.0 %
+Total Sigmoid time:   4170674 ns (0.004 s) 0.0 %
+Total time:           14123941545 ns (14.124 s) 100.0 %
