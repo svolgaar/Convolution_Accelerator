@@ -11,6 +11,7 @@ Midterm project for the Class HW-SW Codesign on using an PYNQ FPGA board to acce
 | + Input row caching | 256 | 256 | 16 | 32 | 12870 | 10369 (19%) | 6494 (6%) | 40 (14%) | 15 (6%) |
 | + memcpy burst transfers (reverted) | 256 | 256 | 16 | 32 | 12856 | 13167 (24%) | 10744 (10%) | 48 (17%) | 45 (20%) |
 | + 4x filter parallelism | 256 | 256 | 16 | 32 | 4853 | 15986 (30%) | 12978 (12%) | 64 (22%) | 66 (30%) |
+| + 8x filter parallelism | 256 | 256 | 16 | 32 | 3374 | 19224 (36%) | 15686 (14%) | 96 (34%) | 88 (40%) |
 
 ## 1. Basic Accelerator Design and Integration
 
@@ -443,28 +444,38 @@ for (uint32_t p = 0; p < N_PARALLEL; ++p) {
 - **4 independent accumulators** with separate bias addition, ReLU, and output writes, all unrolled
 - **Edge case handling**: `nActive` tracks valid filters when `numFilters % 4 != 0`; bounds-checked before output writes
 
-### Impact
+### Impact with N_PARALLEL=4
 - **Conv time**: 12.2s → 4.2s (**2.9x speedup**, close to theoretical 4x)
 - **Total time**: 12.9s → 4.9s (**2.6x overall speedup**)
 - **BRAM**: 40 (14%) → 64 (22%) — 4 separate filter BRAMs
 - **DSPs**: 15 (6%) → 66 (30%) — 4x multipliers for parallel MACs
 - **LUTs**: 10369 (19%) → 15986 (30%) — parallel control logic
 - **FFs**: 6494 (6%) → 12978 (12%) — parallel pipeline registers
-- The gap from ideal 4x speedup comes from filter loading overhead (4 filters loaded sequentially per group)
+
+### Scaling to N_PARALLEL=8
+Doubling the parallelism factor requires only changing the constant and array sizes. Resource usage scales roughly linearly:
+- **BRAM**: 64 (22%) → 96 (34%)
+- **DSPs**: 66 (30%) → 88 (40%)
+- **LUTs**: 15986 (30%) → 19224 (36%)
+- **FFs**: 12978 (12%) → 15686 (14%)
+
+Conv time: 4.2s → 2.7s (**1.55x** over N=4). Total: 4.9s → 3.4s.
 
 ### Per-layer breakdown
 
-| Layer | Channels | Filters | Before (s) | After (s) | Speedup |
-|-------|----------|---------|------------|-----------|---------|
-| Conv 0 | 3 | 32 | 1.603 | 1.046 | 1.5x |
-| Conv 1 | 32 | 64 | 3.785 | 1.259 | 3.0x |
-| Conv 2 | 64 | 128 | 3.389 | 0.991 | 3.4x |
-| Conv 3 | 128 | 256 | 3.101 | 0.841 | 3.7x |
-| Conv 4 | 256 | 64 | 0.337 | 0.088 | 3.8x |
+| Layer | Channels | Filters | N=1 (s) | N=4 (s) | N=8 (s) | Speedup (N=1→8) |
+|-------|----------|---------|---------|---------|---------|-----------------|
+| Conv 0 | 3 | 32 | 1.603 | 1.046 | 0.853 | 1.9x |
+| Conv 1 | 32 | 64 | 3.785 | 1.259 | 0.790 | 4.8x |
+| Conv 2 | 64 | 128 | 3.389 | 0.991 | 0.570 | 5.9x |
+| Conv 3 | 128 | 256 | 3.101 | 0.841 | 0.454 | 6.8x |
+| Conv 4 | 256 | 64 | 0.337 | 0.088 | 0.051 | 6.6x |
 
-Layers with more filters see greater speedup (closer to 4x) because the filter loading overhead is amortized over more spatial computation. Layer 0 (only 3 input channels, 32 filters) benefits least because the computation per filter is small relative to the loading cost.
+Layers with more filters and channels see the greatest speedup because the filter loading overhead is amortized over more spatial computation. Conv 0 (only 3 input channels) benefits least — loading 8 filters of 27 coefficients each is significant relative to the small per-pixel computation (27 MACs per filter). Conv 3 (128 channels, 256 filters) approaches the theoretical 8x because the 1152-coefficient filter load is dwarfed by the spatial computation.
 
-Runtime HW with 4x filter parallelism:
+The N=4→N=8 speedup (1.55x) falls short of the ideal 2x partly due to filter loading taking 2x longer (8 sequential loads vs 4) and partly because Conv 0 is already hitting diminishing returns. N=16 was not attempted as DSP usage would likely exceed the xc7z020's 220 available DSPs.
+
+Runtime HW with N_PARALLEL=4:
 
 xilinx@pynq:~/dogs_cats$ sudo ./cnnSolver dog.9499.jpg.rgba.planar
 [HW] Opening Conv2D accelerator at 0x40000000...
@@ -491,3 +502,31 @@ Total Dense time (SW):148991231 ns (0.149 s) 3.1 %
 Total Flatten time:   450341 ns (0.000 s) 0.0 %
 Total Sigmoid time:   174504 ns (0.000 s) 0.0 %
 Total time:           4852772698 ns (4.853 s) 100.0 %
+
+Runtime HW with N_PARALLEL=8:
+
+xilinx@pynq:~/dogs_cats$ sudo ./cnnSolver dog.9499.jpg.rgba.planar
+[HW] Opening Conv2D accelerator at 0x40000000...
+[HW] Accelerator opened successfully.
+[HW] Allocating DMA-compatible buffers...
+[HW] DMA buffers allocated.
+[HW] Running inference with Conv2D accelerator...
+[HW] OUTPUT: 0.93905449 --> DOG
+Conv 0 (HW) --> 853454534 ns (0.853 s)
+Conv 1 (HW) --> 789558762 ns (0.790 s)
+Conv 2 (HW) --> 569858501 ns (0.570 s)
+Conv 3 (HW) --> 454089467 ns (0.454 s)
+Conv 4 (HW) --> 50742431 ns (0.051 s)
+MaxPool 0 --> 266542631 ns (0.267 s)
+MaxPool 1 --> 125830071 ns (0.126 s)
+MaxPool 2 --> 58853714 ns (0.059 s)
+MaxPool 3 --> 35129185 ns (0.035 s)
+MaxPool 4 --> 1287920 ns (0.001 s)
+Dense 5 (SW) --> 168253960 ns (0.168 s)
+Dense 6 (SW) --> 66250 ns (0.000 s)
+Total Conv time (HW): 2717703695 ns (2.718 s) 80.5 %
+Total MaxPool time:   487643521 ns (0.488 s) 14.5 %
+Total Dense time (SW):168320210 ns (0.168 s) 5.0 %
+Total Flatten time:   468923 ns (0.000 s) 0.0 %
+Total Sigmoid time:   120446 ns (0.000 s) 0.0 %
+Total time:           3374256795 ns (3.374 s) 100.0 %

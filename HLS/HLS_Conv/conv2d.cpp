@@ -39,10 +39,10 @@ void Conv2D_HW(TFXP *input, TFXP * output, TFXP * filters, TFXP * biases,
 #pragma HLS INTERFACE s_axilite port=return
 
   // Parallelization factor for output filters
-  const uint32_t N_PARALLEL = 4;
+  const uint32_t N_PARALLEL = 8;
 
   // Local BRAM buffers — separate filter array per parallel filter for simultaneous access
-  TFXP localFilters[4][256 * 3 * 3]; // N_PARALLEL x (max channels x 3x3 kernel)
+  TFXP localFilters[8][256 * 3 * 3]; // N_PARALLEL x (max channels x 3x3 kernel)
 #pragma HLS ARRAY_PARTITION variable=localFilters complete dim=1
   TFXP rowBuffer[3][4096];           // 3 row buffers, max numChannels * inputWidth = 32*128 = 4096
 
@@ -51,7 +51,7 @@ void Conv2D_HW(TFXP *input, TFXP * output, TFXP * filters, TFXP * biases,
     uint32_t nActive = ((iFilter + N_PARALLEL) <= numFilters) ? N_PARALLEL : (numFilters - iFilter);
 
     // Load biases for this filter group
-    TFXP bias[4];
+    TFXP bias[8];
 #pragma HLS ARRAY_PARTITION variable=bias complete
     for (uint32_t p = 0; p < N_PARALLEL; ++p) {
 #pragma HLS UNROLL
@@ -101,7 +101,7 @@ void Conv2D_HW(TFXP *input, TFXP * output, TFXP * filters, TFXP * biases,
 
       for (uint32_t x = 0; x < (inputWidth-2); ++ x) {
         // Parallel accumulators — one per output filter
-        TFXP acc[4];
+        TFXP acc[8];
 #pragma HLS ARRAY_PARTITION variable=acc complete
         for (uint32_t p = 0; p < N_PARALLEL; ++p) {
 #pragma HLS UNROLL
