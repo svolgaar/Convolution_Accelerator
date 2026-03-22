@@ -1,0 +1,8 @@
+# Vitis HLS build output
+Conv2D_HW_HLS/
+
+# Generated IP
+IP-repo/
+
+# Log files
+vitis_hls.log

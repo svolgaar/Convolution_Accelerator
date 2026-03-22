@@ -21,6 +21,7 @@ typedef int64_t TFXP_MULT;// Intermmediate results of multiplications
 TFXP input[MAX_WIDTH * MAX_HEIGHT * MAX_CHANNELS];
 TFXP output[MAX_WIDTH * MAX_HEIGHT * MAX_FILTERS];
 TFXP coeffs[MAX_CHANNELS * MAX_FILTERS * 9];
+TFXP biases[MAX_FILTERS];
 
 // Use a higher value once done debugging
 #define NUM_REPES 1
@@ -104,7 +105,7 @@ bool CompareVectors(TFXP * input1, TFXP * input2, uint32_t size)
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-bool InitDevice(CConv2DProxy & convolver, TFXP* &inputHW, TFXP* &outputHW, TFXP* &coeffsHW, bool log=true)
+bool InitDevice(CConv2DProxy & convolver, TFXP* &inputHW, TFXP* &outputHW, TFXP* &coeffsHW, TFXP* &biasesHW, bool log=true)
 {
   printf("\n\nThis program requires that the bitstream is loaded in the FPGA.\n");
   printf("This program has to be run with sudo.\n");
@@ -126,14 +127,16 @@ bool InitDevice(CConv2DProxy & convolver, TFXP* &inputHW, TFXP* &outputHW, TFXP*
   inputHW = (TFXP *)convolver.AllocDMACompatible(MAX_WIDTH * MAX_HEIGHT * MAX_CHANNELS * sizeof(TFXP));
   outputHW = (TFXP *)convolver.AllocDMACompatible(MAX_WIDTH * MAX_HEIGHT * MAX_FILTERS * sizeof(TFXP));
   coeffsHW = (TFXP *)convolver.AllocDMACompatible(MAX_CHANNELS * MAX_FILTERS * 9 * sizeof(TFXP));
+  biasesHW = (TFXP *)convolver.AllocDMACompatible(MAX_FILTERS * sizeof(TFXP));
   if (log) {
     printf("DMA memory allocated.\n");
     printf("Input: Virtual address: 0x%08X (%u)\n", (uint32_t)inputHW, (uint32_t)inputHW);
     printf("Output: Virtual address: 0x%08X (%u)\n", (uint32_t)outputHW, (uint32_t)outputHW);
     printf("Coeffs: Virtual address: 0x%08X (%u)\n", (uint32_t)coeffsHW, (uint32_t)coeffsHW);
+    printf("Biases: Virtual address: 0x%08X (%u)\n", (uint32_t)biasesHW, (uint32_t)biasesHW);
   }
 
-  if ( (inputHW == NULL) || (outputHW == NULL) || (coeffsHW == NULL) ) {
+  if ( (inputHW == NULL) || (outputHW == NULL) || (coeffsHW == NULL) || (biasesHW == NULL) ) {
     if (log)
       printf("Error allocating DMA memory.\n");
     return false;
@@ -152,10 +155,10 @@ int main(int argc, char ** argv)
   uint32_t currentOutputSize;
   uint32_t sizes[][2] = { {3, 32}, {16, 16}, {32, 32}, {64, 64}, {128, 128}, {256, 256} };
   uint32_t numSizes = sizeof(sizes) / (sizeof(uint32_t) * 2);
-  TFXP * inputHW, * outputHW, * coeffsHW; // We need specially-allocated arrays to share with the accelerator
-  
+  TFXP * inputHW, * outputHW, * coeffsHW, * biasesHW; // We need specially-allocated arrays to share with the accelerator
+
   CConv2DProxy convolver(false); // Deactivate logging.
-  if (!InitDevice(convolver, inputHW, outputHW, coeffsHW))
+  if (!InitDevice(convolver, inputHW, outputHW, coeffsHW, biasesHW))
     return -1;
 
   srand(time(NULL));
@@ -197,7 +200,7 @@ int main(int argc, char ** argv)
       printf("%s", repe % 2 == 0 ? "." : "*"); fflush(stdout);
       memset(outputHW, 0, currentOutputSize * sizeof(TFXP));
       clock_gettime(CLOCK_MONOTONIC_RAW, &start);
-      Conv2D_HW(inputHW, outputHW, coeffsHW, channels, filters, width, height, 3, 3);
+      convolver.Conv2D_HW(inputHW, outputHW, coeffsHW, biasesHW, channels, filters, width, height, 3, 3, 0);
       clock_gettime(CLOCK_MONOTONIC_RAW, &end);
       elapsedTimeHW += CalcTimeDiff(end, start);
       /** Compare the output of the accelerator with the previously generated output from the SW @todo */
@@ -214,6 +217,7 @@ int main(int argc, char ** argv)
   convolver.FreeDMACompatible(inputHW);
   convolver.FreeDMACompatible(outputHW);
   convolver.FreeDMACompatible(coeffsHW);
+  convolver.FreeDMACompatible(biasesHW);
   return 0;
 }
 

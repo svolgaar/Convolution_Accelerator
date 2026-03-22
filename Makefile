@@ -25,21 +25,25 @@ help:
 	@echo ""
 
 
-ip: IP-repo/$(PROJECT_NAME).zip HLS/conv2d.cpp HLS/conv2d.h
+HLS_SRC := HLS/HLS_Conv
+HLS_SCRIPTS := HLS/Scripts
+Vivado_SCRIPTS := Vivado/Scripts
 
-IP-repo/$(PROJECT_NAME).zip: HLS/conv2d.cpp HLS/conv2d.h
+ip: IP-repo/$(PROJECT_NAME).zip $(HLS_SRC)/conv2d.cpp $(HLS_SRC)/conv2d.h
+
+IP-repo/$(PROJECT_NAME).zip: $(HLS_SRC)/conv2d.cpp $(HLS_SRC)/conv2d.h
 	rm -rf $(PROJECT_NAME)_HLS
-	vitis_hls -f $(PROJECT_NAME)_HLS_impl.tcl
+	vitis_hls -f $(HLS_SCRIPTS)/$(PROJECT_NAME)_HLS_impl.tcl
 
 hls_project: $(PROJECT_NAME)_HLS/hls.app
 
 $(PROJECT_NAME)_HLS/hls.app:
 	rm -rf $(PROJECT_NAME)_HLS
-	vitis_hls -f $(PROJECT_NAME)_HLS.tcl
+	vitis_hls -f $(HLS_SCRIPTS)/$(PROJECT_NAME)_HLS.tcl
 
 hls_sim:
 	rm -rf $(PROJECT_NAME)_HLS
-	vitis_hls -f $(PROJECT_NAME)_HLS_sim.tcl
+	vitis_hls -f $(HLS_SCRIPTS)/$(PROJECT_NAME)_HLS_sim.tcl
 
 
 
@@ -47,12 +51,12 @@ vivado_project: ip $(PROJECT_NAME)_Vivado/
 
 $(PROJECT_NAME)_Vivado/:
 	cd IP-repo; unzip -o ./$(PROJECT_NAME).zip; cd ..
-	vivado -mode batch -source $(PROJECT_NAME)_Vivado.tcl -tclargs --project_name $(PROJECT_NAME)_Vivado
+	vivado -mode batch -source $(Vivado_SCRIPTS)/$(PROJECT_NAME)_Vivado.tcl -tclargs --project_name $(PROJECT_NAME)_Vivado
 
 bitstream: vivado_project $(PROJECT_NAME).bit $(PROJECT_NAME).hwh
-
+ 
 $(PROJECT_NAME).bit $(PROJECT_NAME).hwh:
-	vivado -mode batch -source $(PROJECT_NAME)_Vivado_impl.tcl -tclargs --project_name $(PROJECT_NAME)_Vivado
+	vivado -mode batch -source $(Vivado_SCRIPTS)/$(PROJECT_NAME)_Vivado_impl.tcl -tclargs --project_name $(PROJECT_NAME)_Vivado
 	cp ./$(PROJECT_NAME)_Vivado/$(PROJECT_NAME)_Vivado.runs/impl_1/design_1_wrapper.bit $(PROJECT_NAME).bit
 	cp ./$(PROJECT_NAME)_Vivado/$(PROJECT_NAME)_Vivado.gen/sources_1/bd/design_1/hw_handoff/design_1.hwh $(PROJECT_NAME).hwh
 	cp ./$(PROJECT_NAME)_Vivado/$(PROJECT_NAME)_Vivado.runs/impl_1/design_1_wrapper.ltx $(PROJECT_NAME).ltx

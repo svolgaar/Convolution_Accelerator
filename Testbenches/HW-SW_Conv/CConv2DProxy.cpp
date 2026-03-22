@@ -6,20 +6,20 @@
 #include "CAccelProxy.hpp"
 #include "CConv2DProxy.hpp"
 
-uint32_t CConv2DProxy::Conv2D_HW(void *input, void * output, void * coeffs,
+uint32_t CConv2DProxy::Conv2D_HW(void *input, void * output, void * coeffs, void * biases,
       uint32_t numChannels, uint32_t numFilters,
       uint32_t inputWidth, uint32_t inputHeight,
-      uint32_t convWidth, uint32_t convHeight)
+      uint32_t convWidth, uint32_t convHeight, uint32_t relu)
 {
   volatile TRegs * regs = (TRegs*)accelRegs;
-  uint32_t phyInput, phyOutput, phyCoeffs;
+  uint32_t phyInput, phyOutput, phyCoeffs, phyBiases;
   uint32_t status;
 
   if (logging)
     printf("CConv2DProxy::Conv2D_HW(Input=0x%08X, Output=0x%08X, Coeffes=0x%08X, "
-          "NumChannels=%u, NumFilters=%u, Width=%u, Height=%u, FilterSize=%ux%u)\n", 
-          (uint32_t)input, (uint32_t)output, (uint32_t)coeffs,
-          numChannels, numFilters, inputWidth, inputHeight, convWidth, convHeight);
+          "Biases=0x%08X, NumChannels=%u, NumFilters=%u, Width=%u, Height=%u, FilterSize=%ux%u, ReLU=%u)\n",
+          (uint32_t)input, (uint32_t)output, (uint32_t)coeffs, (uint32_t)biases,
+          numChannels, numFilters, inputWidth, inputHeight, convWidth, convHeight, relu);
 
   if (accelRegs == NULL) {
     if (logging)
@@ -47,17 +47,25 @@ uint32_t CConv2DProxy::Conv2D_HW(void *input, void * output, void * coeffs,
       printf("Error: No physical address found for virtual address 0x%08X\n", (uint32_t)coeffs);
     return VIRT_ADDR_NOT_FOUND;
   }
+  phyBiases = GetDMAPhysicalAddr(biases);
+  if (phyBiases == 0) {
+    if (logging)
+      printf("Error: No physical address found for virtual address 0x%08X\n", (uint32_t)biases);
+    return VIRT_ADDR_NOT_FOUND;
+  }
 
   // Write to registers (todo) DONE
   regs->input_r = phyInput;
   regs->output_r = phyOutput;
   regs->coeffs = phyCoeffs;
+  regs->biases = phyBiases;
   regs->numChannels = numChannels;
   regs->numFilters = numFilters;
   regs->inputWidth = inputWidth;
   regs->inputHeight = inputHeight;
   regs->convWidth = convWidth;
   regs->convHeight = convHeight;
+  regs->relu = relu;
 
   if (logging)
     printf("\nStarting accel...\n");

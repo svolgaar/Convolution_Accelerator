@@ -15,26 +15,31 @@ static TFXP_MULT FXP_Mult(TFXP a, TFXP b, uint32_t decimalBits = DECIMALS)
   return res;
 }
 
-void Conv2D_HW(TFXP *input, TFXP * output, TFXP * filters,
+void Conv2D_HW(TFXP *input, TFXP * output, TFXP * filters, TFXP * biases,
       uint32_t numChannels, uint32_t numFilters,
       uint32_t inputWidth, uint32_t inputHeight,
-      uint32_t convWidth, uint32_t convHeight)
+      uint32_t convWidth, uint32_t convHeight,
+      uint32_t relu)
 {
 #pragma HLS INTERFACE m_axi port=input bundle=master1 offset=slave
 #pragma HLS INTERFACE m_axi port=output bundle=master1 offset=slave
 #pragma HLS INTERFACE m_axi port=filters bundle=master1 offset=slave
-#pragma HLS INTERFACE s_axilite port=input        
-#pragma HLS INTERFACE s_axilite port=output       
-#pragma HLS INTERFACE s_axilite port=filters      
-#pragma HLS INTERFACE s_axilite port=numChannels  
-#pragma HLS INTERFACE s_axilite port=numFilters   
-#pragma HLS INTERFACE s_axilite port=inputWidth   
-#pragma HLS INTERFACE s_axilite port=inputHeight  
-#pragma HLS INTERFACE s_axilite port=convWidth   
-#pragma HLS INTERFACE s_axilite port=convHeight   
-#pragma HLS INTERFACE s_axilite port=return       
+#pragma HLS INTERFACE m_axi port=biases bundle=master1 offset=slave
+#pragma HLS INTERFACE s_axilite port=input
+#pragma HLS INTERFACE s_axilite port=output
+#pragma HLS INTERFACE s_axilite port=filters
+#pragma HLS INTERFACE s_axilite port=biases
+#pragma HLS INTERFACE s_axilite port=numChannels
+#pragma HLS INTERFACE s_axilite port=numFilters
+#pragma HLS INTERFACE s_axilite port=inputWidth
+#pragma HLS INTERFACE s_axilite port=inputHeight
+#pragma HLS INTERFACE s_axilite port=convWidth
+#pragma HLS INTERFACE s_axilite port=convHeight
+#pragma HLS INTERFACE s_axilite port=relu
+#pragma HLS INTERFACE s_axilite port=return
 
   for (uint32_t iFilter = 0; iFilter < numFilters; ++ iFilter) {
+    TFXP bias = biases[iFilter];
     for (uint32_t y = 0; y < (inputHeight-2); ++y) {
       for (uint32_t x = 0; x < (inputWidth-2); ++ x) {
         TFXP acc;
@@ -49,6 +54,12 @@ void Conv2D_HW(TFXP *input, TFXP * output, TFXP * filters,
               acc += FXP_Mult(filterValue, pixelValue, DECIMALS);
             }
           }
+        }
+        // Add bias for this filter
+        acc += bias;
+        // Apply ReLU if enabled
+        if (relu) {
+          acc = (acc < 0) ? 0 : acc;
         }
         //output[iFilter][y][x] = acc;
         *(output + iFilter * (inputHeight-2)*(inputWidth-2) + y*(inputWidth-2) + x) = acc;
