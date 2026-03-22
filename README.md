@@ -17,6 +17,7 @@ Midterm project for the Class HW-SW Codesign on using an PYNQ FPGA board to acce
 | + 16x filter parallelism | 256 | 256 | 16 | 32 | 2509 | 22196 (41%) | 18290 (17%) | 160 (57%) | 137 (62%) |
 | + Output row buffering + remove latency hint | 256 | 256 | 16 | 32 | 1402 | 17099 (32%) | 13367 (12%) | 176 (62%) | 91 (41%) |
 | + Loop flattening + interleaved filter load | 256 | 256 | 16 | 32 | 1397 | 16976 (31%) | 20575 (19%) | 176 (62%) | 92 (41%) |
+| + 2× x-position parallelism | 256 | 256 | 16 | 32 | 1116 | 24920 (46%) | 20913 (19%) | 192 (68%) | 140 (63%) |
 
 ## 1. Basic Accelerator Design and Integration
 
@@ -735,6 +736,43 @@ The changes produced a negligible improvement (~5ms). This confirms that the ove
 
 The changes are kept for cleaner code structure despite minimal performance impact.
 
+## 11. 2× X-Position Parallelism (DSP Utilization)
+
+### Motivation
+After all previous optimizations, DSP usage sat at only 92/220 (41%) — nearly 60% of the FPGA's multiply-accumulate resources were unused. The key insight is that for two adjacent output x-positions, the **filter coefficients are identical** (same channel, cy, cx) — only the input pixel values differ (offset by 1). This means x-parallelism can double the DSP usage without duplicating the filter BRAM storage.
+
+### Changes
+1. **X-loop processes 2 pixels per iteration**: The x-loop now steps by 2, computing two output pixels simultaneously using separate accumulator arrays (`acc0[16]` and `acc1[16]`). Each cycle reads two adjacent pixels (`pix0`, `pix1`) and multiplies both by the same filter value.
+
+2. **`rowBuffer` partitioned** with `cyclic factor=2 dim=2`: Enables two simultaneous reads from adjacent addresses in the same cycle, feeding both pixel pipelines.
+
+3. **`outRowBuf` partitioned** with `cyclic factor=2 dim=2`: Enables two simultaneous writes per cycle to store both computed pixels.
+
+### Results
+| Layer | Before (ms) | After (ms) | Speedup |
+|-------|-------------|------------|---------|
+| Conv 0 (3ch→32f) | 99 | 73 | 1.36× |
+| Conv 1 (32ch→64f) | 236 | 142 | 1.66× |
+| Conv 2 (64ch→64f) | 211 | 127 | 1.66× |
+| Conv 3 (64ch→128f) | 198 | 125 | 1.58× |
+| Conv 4 (128ch→256f) | 26 | 19 | 1.37× |
+| **Total Conv** | **770** | **485** | **1.59×** |
+| **Total** | **1397** | **1116** | **1.25×** |
+
+The 1.59× Conv speedup is close to the theoretical 2× from halving the x-loop iterations. The gap is due to non-compute phases (filter loading, row prefetch, output burst writes) which are unchanged.
+
+### Resources
+- **BRAM**: 176 (62%) → 192 (68%) — +16 from rowBuffer and outRowBuf partitioning
+- **DSP**: 92 (41%) → 140 (63%) — compute pipeline doubled from 52 to 100 DSPs
+- **LUT**: 16976 (31%) → 24920 (46%) — additional multiplexing and control logic
+- **FF**: 20575 (19%) → 20913 (19%) — essentially unchanged
+
+### Why filter reads don't need duplication
+Unlike cx-unrolling (which failed due to BRAM constraints), x-parallelism reads the same `localFilters[p][...]` value for both pixel computations. The filter address depends on `(iChannel, cy, cx)` — not on `x`. Only `rowBuffer` needs dual-port access, and since the two pixel addresses differ by exactly 1, `cyclic factor=2` partitioning places them in different BRAM banks, enabling conflict-free parallel reads.
+
+### Current bottleneck
+Conv (43.5%) and MaxPool (43.1%) are now virtually tied. The FPGA sits idle nearly half the total inference time waiting for software MaxPool to complete on the ARM CPU.
+
 ### Final performance summary
-Overall speedup from the original software-only baseline: **28.0s → 1.397s = 20.0×**
-Overall speedup from the initial HW accelerator: **86.4s → 1.397s = 61.8×**
+Overall speedup from the original software-only baseline: **28.0s → 1.116s = 25.1×**
+Overall speedup from the initial HW accelerator: **86.4s → 1.116s = 77.4×**
