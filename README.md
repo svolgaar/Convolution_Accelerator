@@ -12,6 +12,7 @@ Midterm project for the Class HW-SW Codesign on using an PYNQ FPGA board to acce
 | + memcpy burst transfers (reverted) | 256 | 256 | 16 | 32 | 12856 | 13167 (24%) | 10744 (10%) | 48 (17%) | 45 (20%) |
 | + 4x filter parallelism | 256 | 256 | 16 | 32 | 4853 | 15986 (30%) | 12978 (12%) | 64 (22%) | 66 (30%) |
 | + 8x filter parallelism | 256 | 256 | 16 | 32 | 3374 | 19224 (36%) | 15686 (14%) | 96 (34%) | 88 (40%) |
+| + 4-buffer prefetch overlap | 256 | 256 | 16 | 32 | 3190 | 17117 (32%) | 12607 (11%) | 96 (34%) | 88 (40%) |
 
 ## 1. Basic Accelerator Design and Integration
 
@@ -530,3 +531,71 @@ Total Dense time (SW):168320210 ns (0.168 s) 5.0 %
 Total Flatten time:   468923 ns (0.000 s) 0.0 %
 Total Sigmoid time:   120446 ns (0.000 s) 0.0 %
 Total time:           3374256795 ns (3.374 s) 100.0 %
+
+
+## 6. Overlapping Data Transfers with Computation (4-Buffer Prefetch)
+
+### Problem
+With 3 row buffers and circular indexing `% 3`, the buffer slot for the next row to load (`(y+3) % 3 == y % 3`) is the same slot being read for the current computation. This forces the row load and computation to be strictly sequential — the accelerator must finish loading the new row before starting computation, adding idle time.
+
+### Solution
+Add a 4th row buffer so the prefetch target never conflicts with the 3 rows being read:
+
+```cpp
+// 3 buffers: (y+3) % 3 == y % 3 → CONFLICT (same slot)
+// 4 buffers: (y+3) % 4 != y%4, (y+1)%4, (y+2)%4 → NO CONFLICT
+TFXP rowBuffer[4][4096];
+```
+
+The initial load now fills 4 rows (0,1,2,3) instead of 3. During each y iteration, the prefetch of row `y+3` writes to buffer `(y+3) % 4` while the computation reads from `y%4`, `(y+1)%4`, `(y+2)%4` — all different slots.
+
+An additional benefit: `% 4` is a simple 2-bit mask in hardware, whereas `% 3` requires division logic. This reduced the compute pipeline iteration latency from 43 cycles to 11 cycles (II=1 maintained in both cases).
+
+### Impact
+- **Conv time**: 2.718s → 2.562s (**5.7% improvement**)
+- **Total time**: 3.374s → 3.190s (**5.5% improvement**)
+- **BRAM**: 96 (34%) — unchanged (4th buffer reuses existing BRAM allocation)
+- **DSPs**: 88 (40%) — unchanged
+- **LUTs**: 19224 (36%) → 17117 (32%) — reduced due to simpler `% 4` modulo logic
+- **FFs**: 15686 (14%) → 12607 (11%) — fewer pipeline stages needed
+- **Pipeline iteration latency**: 43 → 11 cycles (due to `% 4` bit-mask vs `% 3` division)
+
+### Per-layer breakdown
+
+| Layer | Channels | Filters | 3-buf (s) | 4-buf (s) | Improvement |
+|-------|----------|---------|-----------|-----------|-------------|
+| Conv 0 | 3 | 32 | 0.853 | 0.770 | 9.7% |
+| Conv 1 | 32 | 64 | 0.790 | 0.749 | 5.2% |
+| Conv 2 | 64 | 128 | 0.570 | 0.551 | 3.3% |
+| Conv 3 | 128 | 256 | 0.454 | 0.446 | 1.8% |
+| Conv 4 | 256 | 64 | 0.051 | 0.046 | 9.8% |
+
+Conv 0 and Conv 4 benefited most — layers where the row loading time is a larger fraction of the total computation.
+
+Runtime HW with 4-buffer prefetch overlap:
+
+xilinx@pynq:~/dogs_cats$ sudo ./cnnSolver dog.9499.jpg.rgba.planar
+[HW] Opening Conv2D accelerator at 0x40000000...
+[HW] Accelerator opened successfully.
+[HW] Allocating DMA-compatible buffers...
+[HW] DMA buffers allocated.
+[HW] Running inference with Conv2D accelerator...
+[HW] OUTPUT: 0.93905449 --> DOG
+Conv 0 (HW) --> 770464709 ns (0.770 s)
+Conv 1 (HW) --> 749196507 ns (0.749 s)
+Conv 2 (HW) --> 550978526 ns (0.551 s)
+Conv 3 (HW) --> 445885147 ns (0.446 s)
+Conv 4 (HW) --> 45952661 ns (0.046 s)
+MaxPool 0 --> 266513821 ns (0.267 s)
+MaxPool 1 --> 125884627 ns (0.126 s)
+MaxPool 2 --> 58840988 ns (0.059 s)
+MaxPool 3 --> 25607311 ns (0.026 s)
+MaxPool 4 --> 1187262 ns (0.001 s)
+Dense 5 (SW) --> 148850061 ns (0.149 s)
+Dense 6 (SW) --> 67948 ns (0.000 s)
+Total Conv time (HW): 2562477550 ns (2.562 s) 80.3 %
+Total MaxPool time:   478034009 ns (0.478 s) 15.0 %
+Total Dense time (SW):148918009 ns (0.149 s) 4.7 %
+Total Flatten time:   470428 ns (0.000 s) 0.0 %
+Total Sigmoid time:   164052 ns (0.000 s) 0.0 %
+Total time:           3190064048 ns (3.190 s) 100.0 %
