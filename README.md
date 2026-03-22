@@ -13,6 +13,9 @@ Midterm project for the Class HW-SW Codesign on using an PYNQ FPGA board to acce
 | + 4x filter parallelism | 256 | 256 | 16 | 32 | 4853 | 15986 (30%) | 12978 (12%) | 64 (22%) | 66 (30%) |
 | + 8x filter parallelism | 256 | 256 | 16 | 32 | 3374 | 19224 (36%) | 15686 (14%) | 96 (34%) | 88 (40%) |
 | + 4-buffer prefetch overlap | 256 | 256 | 16 | 32 | 3190 | 17117 (32%) | 12607 (11%) | 96 (34%) | 88 (40%) |
+| + Separate output HP port (reverted) | 256 | 256 | 16 | 32 | 3190 | 18435 (34%) | 13339 (12%) | 96 (34%) | 88 (40%) |
+| + 16x filter parallelism | 256 | 256 | 16 | 32 | 2509 | 22196 (41%) | 18290 (17%) | 160 (57%) | 137 (62%) |
+| + Output row buffering + remove latency hint | 256 | 256 | 16 | 32 | 1402 | 17099 (32%) | 13367 (12%) | 176 (62%) | 91 (41%) |
 
 ## 1. Basic Accelerator Design and Integration
 
@@ -599,3 +602,98 @@ Total Dense time (SW):148918009 ns (0.149 s) 4.7 %
 Total Flatten time:   470428 ns (0.000 s) 0.0 %
 Total Sigmoid time:   164052 ns (0.000 s) 0.0 %
 Total time:           3190064048 ns (3.190 s) 100.0 %
+
+
+## 7. Separate AXI HP Port for Output (Attempted — Reverted)
+
+### Motivation
+With 8 parallel output writes per pixel position sharing the same AXI port (master1) as input row reads, there was potential contention between reads and writes. The xc7z020 has 4 HP ports — we were only using 2 (HP0 for input+output, HP1 for filters+biases). Splitting output writes onto a dedicated HP port would eliminate read/write arbitration on master1.
+
+### Changes Attempted
+- **HLS**: Moved output from `bundle=master1` to `bundle=master3`, creating a third AXI master port
+- **Vivado block design**: Enabled HP2, added `axi_mem_intercon_2`, wired `master3` → HP2 with clock/reset/address mapping
+
+Port layout:
+- HP0 (master1): input reads only
+- HP1 (master2): filter + bias reads only
+- HP2 (master3): output writes only
+
+### Results
+**Runtime was identical**: 3.190s → 3.190s. Per-layer times matched to the millisecond, confirming the design is entirely **compute-bound**. The AXI memory interface has more than enough bandwidth for the current access patterns — the bottleneck is the multiply-accumulate computation in the convolution pipeline, not DDR transfer throughput or port contention.
+
+### Resource Cost
+The additional AXI adapter logic increased resources for zero benefit:
+- **LUTs**: 17117 (32%) → 18435 (34%)
+- **FFs**: 12607 (11%) → 13339 (12%)
+
+### Decision
+Reverted to 2-port configuration (master1 for input+output, master2 for filters+biases) to keep the design simpler. Further speedup would require increasing compute throughput (more parallel filters or higher clock frequency), not memory bandwidth.
+
+## 8. 16x Filter Parallelism
+
+### Motivation
+With N_PARALLEL=8 at 40% DSP and 34% BRAM, there was headroom to double the parallelism factor to 16, processing 16 output filters simultaneously.
+
+### Changes
+- Increased `N_PARALLEL` from 8 to 16
+- Doubled all parallel arrays: `localFilters[16][...]`, `bias[16]`, `acc[16]`
+
+### Results
+| Layer | N=8 (ms) | N=16 (ms) | Speedup |
+|-------|----------|-----------|---------|
+| Conv 0 (3ch→32f) | 770 | 716 | 1.08× |
+| Conv 1 (32ch→64f) | 749 | 535 | 1.40× |
+| Conv 2 (64ch→64f) | 551 | 350 | 1.57× |
+| Conv 3 (64ch→128f) | 446 | 256 | 1.74× |
+| Conv 4 (128ch→256f) | 46 | 25 | 1.84× |
+| **Total Conv** | **2562** | **1882** | **1.36×** |
+| **Total** | **3190** | **2509** | **1.27×** |
+
+Scaling improves with more filters — Conv 3 and Conv 4 benefit most because 128/256 filters divide evenly by 16. Conv 0 barely improves because with only 32 filters, going from 4 groups (N=8) to 2 groups (N=16) reduces overhead proportionally less.
+
+### Resources
+- **BRAM**: 96 (34%) → 160 (57%) — 16 separate filter BRAMs instead of 8
+- **DSP**: 88 (40%) → 137 (62%) — 16 parallel multipliers instead of 8
+- **LUT**: 17117 (32%) → 22196 (41%)
+- **FF**: 12607 (11%) → 18290 (17%)
+
+N=32 was also attempted but exceeded FPGA resources during synthesis.
+
+## 9. Output Row Buffering and AXI Latency Hint Removal
+
+### Motivation
+Analysis of the cycle budget revealed that **output writes were the dominant bottleneck**, not the MAC computation. For Conv 0 (3 input channels), the compute loop takes only 27 cycles per pixel, but writing 16 output values to 16 different output filter planes required 16 individual scattered AXI transactions per pixel — each incurring transaction setup overhead. For Conv 0, the output writes were taking roughly 12× longer than the actual computation.
+
+Additionally, the `latency=20` parameter on the AXI interface pragmas was telling HLS to pessimistically assume 20 cycles of AXI round-trip latency, causing the scheduler to insert unnecessary pipeline bubbles.
+
+### Changes
+1. **Output row buffer** (`outRowBuf[16][256]`): Instead of writing each output pixel directly to DDR as it's computed, we buffer an entire output row per parallel filter in local BRAM. After the full x-loop completes, each filter's row is burst-written to DDR as consecutive addresses — enabling efficient AXI burst transfers instead of scattered single-beat writes.
+
+2. **Removed `latency=20`** from all four AXI `m_axi` interface pragmas, letting HLS use its default latency estimate. This allows the scheduler to overlap AXI transactions more aggressively.
+
+### Results
+| Layer | Before (ms) | After (ms) | Speedup |
+|-------|-------------|------------|---------|
+| Conv 0 (3ch→32f) | 716 | 100 | 7.2× |
+| Conv 1 (32ch→64f) | 535 | 238 | 2.2× |
+| Conv 2 (64ch→64f) | 350 | 215 | 1.6× |
+| Conv 3 (64ch→128f) | 256 | 199 | 1.3× |
+| Conv 4 (128ch→256f) | 25 | 23 | 1.1× |
+| **Total Conv** | **1882** | **775** | **2.43×** |
+| **Total** | **2509** | **1402** | **1.79×** |
+
+Conv 0 saw the largest speedup (7.2×) because with only 3 input channels, its compute loop was very short and the scattered output writes dominated execution time. Deeper layers with more channels (64-256) saw smaller improvements because the compute loop already dominates over the output writes.
+
+Overall speedup from the original software-only baseline: **86.4s → 1.402s = 61.6×**
+
+### Resources
+- **BRAM**: 160 (57%) → 176 (62%) — 16 extra BRAMs for the output row buffers
+- **DSP**: 137 (62%) → 91 (41%) — reduced due to removing the `latency=20` hint allowing HLS to share DSP resources more efficiently
+- **LUT**: 22196 (41%) → 17099 (32%) — also reduced
+- **FF**: 18290 (17%) → 13367 (12%) — also reduced
+
+### Why output buffering helps so much
+Without buffering, each (x,y) pixel computation ended with 16 writes to scattered memory addresses (one per output filter plane), each creating a separate AXI write transaction. With buffering, the same 16×254 writes per row become 16 sequential burst writes of 254 consecutive elements each. AXI burst transfers amortize the transaction setup overhead across many data beats, making them dramatically more efficient than individual scattered writes.
+
+### Remaining bottleneck
+With Conv at 0.775s (55.3%), MaxPool is now the second-largest component at 0.477s (34.0%) — entirely in software on the ARM CPU. The FPGA sits idle during MaxPool execution.

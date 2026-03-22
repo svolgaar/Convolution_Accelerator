@@ -21,10 +21,10 @@ void Conv2D_HW(TFXP *input, TFXP * output, TFXP * filters, TFXP * biases,
       uint32_t convWidth, uint32_t convHeight,
       uint32_t relu)
 {
-#pragma HLS INTERFACE m_axi port=input bundle=master1 offset=slave depth=196608 max_read_burst_length=256 num_read_outstanding=16 latency=20
-#pragma HLS INTERFACE m_axi port=output bundle=master3 offset=slave depth=2064512 max_write_burst_length=256 num_write_outstanding=16 latency=20
-#pragma HLS INTERFACE m_axi port=filters bundle=master2 offset=slave depth=27648 max_read_burst_length=256 num_read_outstanding=16 latency=20
-#pragma HLS INTERFACE m_axi port=biases bundle=master2 offset=slave depth=256 max_read_burst_length=256 num_read_outstanding=16 latency=20
+#pragma HLS INTERFACE m_axi port=input bundle=master1 offset=slave depth=196608 max_read_burst_length=256 num_read_outstanding=16
+#pragma HLS INTERFACE m_axi port=output bundle=master1 offset=slave depth=2064512 max_write_burst_length=256 num_write_outstanding=16
+#pragma HLS INTERFACE m_axi port=filters bundle=master2 offset=slave depth=27648 max_read_burst_length=256 num_read_outstanding=16
+#pragma HLS INTERFACE m_axi port=biases bundle=master2 offset=slave depth=256 max_read_burst_length=256 num_read_outstanding=16
 #pragma HLS INTERFACE s_axilite port=input
 #pragma HLS INTERFACE s_axilite port=output
 #pragma HLS INTERFACE s_axilite port=filters
@@ -39,22 +39,28 @@ void Conv2D_HW(TFXP *input, TFXP * output, TFXP * filters, TFXP * biases,
 #pragma HLS INTERFACE s_axilite port=return
 
   // Parallelization factor for output filters
-  const uint32_t N_PARALLEL = 8;
+  const uint32_t N_PARALLEL = 16;
 
   // Local BRAM buffers — separate filter array per parallel filter for simultaneous access
-  TFXP localFilters[8][256 * 3 * 3]; // N_PARALLEL x (max channels x 3x3 kernel)
+  TFXP localFilters[16][256 * 3 * 3]; // N_PARALLEL x (max channels x 3x3 kernel)
 #pragma HLS ARRAY_PARTITION variable=localFilters complete dim=1
   // 4 row buffers (instead of 3) to allow prefetch of next row without conflicting
   // with the 3 rows being read during computation. With 3 buffers, (y+3)%3 == y%3 — collision.
   // With 4 buffers, the prefetch target is always a different slot than the 3 being read.
   TFXP rowBuffer[4][4096];           // 4 row buffers, max numChannels * inputWidth = 32*128 = 4096
 
+  // Output row buffer: accumulate a full row of outputs per parallel filter,
+  // then burst-write to DDR instead of individual scattered writes per pixel.
+  // Max output width = 256-2 = 254 pixels.
+  TFXP outRowBuf[16][256];
+#pragma HLS ARRAY_PARTITION variable=outRowBuf complete dim=1
+
   for (uint32_t iFilter = 0; iFilter < numFilters; iFilter += N_PARALLEL) {
     // Number of active filters in this group (handles case where numFilters % N_PARALLEL != 0)
     uint32_t nActive = ((iFilter + N_PARALLEL) <= numFilters) ? N_PARALLEL : (numFilters - iFilter);
 
     // Load biases for this filter group
-    TFXP bias[8];
+    TFXP bias[16];
 #pragma HLS ARRAY_PARTITION variable=bias complete
     for (uint32_t p = 0; p < N_PARALLEL; ++p) {
 #pragma HLS UNROLL
@@ -87,10 +93,11 @@ void Conv2D_HW(TFXP *input, TFXP * output, TFXP * filters, TFXP * biases,
       }
     }
 
-    for (uint32_t y = 0; y < (inputHeight-2); ++y) {
+    uint32_t outWidth = inputWidth - 2;
+    uint32_t outHeight = inputHeight - 2;
+
+    for (uint32_t y = 0; y < outHeight; ++y) {
       // Prefetch row y+3 into buffer (y+3)%4 while computing with rows y, y+1, y+2
-      // This overlaps the DDR read with the convolution computation below.
-      // For y=0, row 3 was already loaded in the initial load above.
       if (y > 0 && (y + 3) < inputHeight) {
         uint32_t prefetchRow = y + 3;
         uint32_t bufIdx = prefetchRow % 4;
@@ -105,9 +112,10 @@ void Conv2D_HW(TFXP *input, TFXP * output, TFXP * filters, TFXP * biases,
         }
       }
 
-      for (uint32_t x = 0; x < (inputWidth-2); ++ x) {
+      // Compute full output row into local buffer
+      for (uint32_t x = 0; x < outWidth; ++ x) {
         // Parallel accumulators — one per output filter
-        TFXP acc[8];
+        TFXP acc[16];
 #pragma HLS ARRAY_PARTITION variable=acc complete
         for (uint32_t p = 0; p < N_PARALLEL; ++p) {
 #pragma HLS UNROLL
@@ -128,15 +136,25 @@ void Conv2D_HW(TFXP *input, TFXP * output, TFXP * filters, TFXP * biases,
           }
         }
 
-        // Add bias, apply ReLU, and write output for each active filter
+        // Add bias, apply ReLU, store to output row buffer
         for (uint32_t p = 0; p < N_PARALLEL; ++p) {
 #pragma HLS UNROLL
           acc[p] += bias[p];
           if (relu) {
             acc[p] = (acc[p] < 0) ? (TFXP)0 : acc[p];
           }
-          if ((iFilter + p) < numFilters) {
-            *(output + (iFilter + p) * (inputHeight-2)*(inputWidth-2) + y*(inputWidth-2) + x) = acc[p];
+          outRowBuf[p][x] = acc[p];
+        }
+      }
+
+      // Burst-write each filter's output row from local buffer to DDR
+      // Each filter's row is consecutive in memory, enabling efficient burst transfers
+      for (uint32_t p = 0; p < N_PARALLEL; ++p) {
+        if ((iFilter + p) < numFilters) {
+          uint32_t dstBase = (iFilter + p) * outHeight * outWidth + y * outWidth;
+          for (uint32_t x = 0; x < outWidth; ++x) {
+#pragma HLS PIPELINE II=1
+            *(output + dstBase + x) = outRowBuf[p][x];
           }
         }
       }
