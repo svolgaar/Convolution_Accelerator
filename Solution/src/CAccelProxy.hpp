@@ -16,6 +16,10 @@ class CAccelProxy {
     // Map of virtual addresses to physical addresses
     std::map<uint32_t, uint32_t> dmaMappings;
 
+    // Optional pointer to another proxy whose DMA mappings we can look up
+    // (without copying, so the other proxy remains the owner).
+    const CAccelProxy * sharedDMAProxy;
+
     // Called by the destructor to free any dangling DMA allocations.
     void InternalEmptyDMAAllocs();
 
@@ -31,12 +35,18 @@ class CAccelProxy {
     uint32_t Open(uint32_t BaseAddr, uint32_t MappingSize = 65536, volatile void ** AccelRegsPointer = NULL);
 
     // Allocates a block of DMA-compatible memory and returns the corresponding address in this application virtual address space.
-    // The class keeps an internal map of virtual to physical addresses, so that derived classes can translate the virtual 
+    // The class keeps an internal map of virtual to physical addresses, so that derived classes can translate the virtual
     // addresses supplied by the applications.
     void * AllocDMACompatible(uint32_t Size, uint32_t Cacheable = 0);
     bool FreeDMACompatible(void * VirtAddr);
     // The application should never use the physical address. This is just for debugging purposes.
     uint32_t GetDMAPhysicalAddr(void * VirtAddr);
+
+    // Allow this proxy to look up DMA addresses from another proxy without
+    // copying. The other proxy remains the owner and is responsible for freeing.
+    void ShareDMAMappings(const CAccelProxy & other) {
+      sharedDMAProxy = &other;
+    }
 };
 
 

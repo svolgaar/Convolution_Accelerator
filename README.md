@@ -18,6 +18,8 @@ Midterm project for the Class HW-SW Codesign on using an PYNQ FPGA board to acce
 | + Output row buffering + remove latency hint | 256 | 256 | 16 | 32 | 1402 | 17099 (32%) | 13367 (12%) | 176 (62%) | 91 (41%) |
 | + Loop flattening + interleaved filter load | 256 | 256 | 16 | 32 | 1397 | 16976 (31%) | 20575 (19%) | 176 (62%) | 92 (41%) |
 | + 2× x-position parallelism | 256 | 256 | 16 | 32 | 1116 | 24920 (46%) | 20913 (19%) | 192 (68%) | 140 (63%) |
+| + MaxPool HW accelerator | 256 | 256 | 16 | 32 | 744 | — | — | — | — |
+| + MaxPool merged burst reads | 256 | 256 | 16 | 32 | 739 | — | — | — | — |
 
 ## 1. Basic Accelerator Design and Integration
 
@@ -773,6 +775,168 @@ Unlike cx-unrolling (which failed due to BRAM constraints), x-parallelism reads 
 ### Current bottleneck
 Conv (43.5%) and MaxPool (43.1%) are now virtually tied. The FPGA sits idle nearly half the total inference time waiting for software MaxPool to complete on the ARM CPU.
 
+## 12. MaxPool Hardware Accelerator
+
+### Motivation
+After all Conv2D optimizations, Conv (43.5%) and MaxPool (43.1%) were virtually tied as bottlenecks. The ARM CPU spent 0.481s on software MaxPool — nearly half the total inference time — while the FPGA sat idle. MaxPool is a simple 2×2 max operation with stride 2, requiring zero multiplications (no DSPs), making it an ideal candidate for a lightweight hardware accelerator.
+
+### HLS Design
+The MaxPool accelerator ([maxpool.cpp](HLS/HLS_MaxPool/maxpool.cpp)) implements 2×2 max pooling with stride 2:
+
+- **Separate AXI ports**: `gmem0` for input reads, `gmem1` for output writes — no read/write contention
+- **Row-buffered**: Burst-reads 2 input rows into local BRAM (`rowBuf0`, `rowBuf1`), computes 2×2 max, burst-writes the output row (`outBuf`)
+- **Handles odd dimensions**: Matches the software MaxPool behavior by truncating odd width/height
+- **Zero DSPs**: Pure comparison logic (no multiplies), minimal BRAM footprint (3 × 256-entry buffers)
+
+### Vivado Integration
+- **HP2 and HP3**: MaxPool `gmem0` routed through `axi_mem_intercon_2` to HP2, `gmem1` through `axi_mem_intercon_3` to HP3
+- **AXI peripheral bus**: `ps7_0_axi_periph` expanded to 2 master ports — M00 for Conv2D control, M01 for MaxPool control
+- **Address**: MaxPool control registers at `0x40010000`
+
+### Software Integration
+- **CMaxPoolProxy** ([CMaxPoolProxy.hpp](Solution/src/CMaxPoolProxy.hpp), [CMaxPoolProxy.cpp](Solution/src/CMaxPoolProxy.cpp)): Follows the same `CAccelProxy` pattern as `CConv2DProxy`. Register offsets verified against HLS-generated `xmaxpool_hw_hw.h`.
+- **DMA address sharing**: Since buffers are allocated via the Conv2D proxy, the MaxPool proxy uses `ShareDMAMappings()` to look up virtual→physical address translations from the Conv2D proxy's mapping table without copying (avoids double-free on cleanup).
+- **Inference calls**: All 5 `MaxPool(...)` software calls replaced with `maxpooler.MaxPool_HW(...)` in [model.cpp](Solution/src/model.cpp).
+
+### Results
+| Layer | SW MaxPool (ms) | HW MaxPool (ms) | Speedup |
+|-------|----------------|-----------------|---------|
+| MaxPool 0 (32ch, 254×254) | 266 | 40.3 | 6.6× |
+| MaxPool 1 (64ch, 125×125) | 126 | 21.4 | 5.9× |
+| MaxPool 2 (128ch, 60×60) | 59 | 12.1 | 4.9× |
+| MaxPool 3 (256ch, 28×28) | 26 | 7.3 | 3.6× |
+| MaxPool 4 (64ch, 12×12) | 1.2 | 0.6 | 2.0× |
+| **Total MaxPool** | **478** | **82** | **5.8×** |
+| **Total inference** | **1116** | **744** | **1.50×** |
+
+### Current bottleneck breakdown
+- **Conv (HW): 68.9%** (0.512s)
+- **Dense (SW): 20.0%** (0.149s)
+- **MaxPool (HW): 11.0%** (0.082s)
+- Flatten + Sigmoid: ~0.1%
+
+Runtime HW with MaxPool accelerator:
+
+xilinx@pynq:~/dogs_cats$ sudo ./cnnSolver dog.9499.jpg.rgba.planar
+[HW] Opening Conv2D accelerator at 0x40000000...
+[HW] Accelerator opened successfully.
+[HW] Opening MaxPool accelerator at 0x40010000...
+[HW] MaxPool accelerator opened successfully.
+[HW] Allocating DMA-compatible buffers...
+[HW] DMA buffers allocated.
+[HW] Running inference with Conv2D accelerator...
+[HW] OUTPUT: 0.93905449 --> DOG
+Conv 0 (HW) --> 73981713 ns (0.074 s)
+Conv 1 (HW) --> 145555357 ns (0.146 s)
+Conv 2 (HW) --> 132664840 ns (0.133 s)
+Conv 3 (HW) --> 137935606 ns (0.138 s)
+Conv 4 (HW) --> 22146129 ns (0.022 s)
+MaxPool 0 --> 40320624 ns (0.040 s)
+MaxPool 1 --> 21421384 ns (0.021 s)
+MaxPool 2 --> 12117154 ns (0.012 s)
+MaxPool 3 --> 7318206 ns (0.007 s)
+MaxPool 4 --> 562018 ns (0.001 s)
+Dense 5 (SW) --> 149007061 ns (0.149 s)
+Dense 6 (SW) --> 67908 ns (0.000 s)
+Total Conv time (HW): 512283645 ns (0.512 s) 68.9 %
+Total MaxPool time:   81739386 ns (0.082 s) 11.0 %
+Total Dense time (SW):149074969 ns (0.149 s) 20.0 %
+Total Flatten time:   448108 ns (0.000 s) 0.1 %
+Total Sigmoid time:   140692 ns (0.000 s) 0.0 %
+Total time:           743686800 ns (0.744 s) 100.0 %
+
+## 13. MaxPool Merged Burst Reads
+
+### Motivation
+In the initial MaxPool HLS design, each row-pair required two separate AXI burst reads (one per row). Since the data is stored in CHW layout, consecutive rows within a channel are contiguous in memory — meaning both rows can be read in a single burst transaction, halving the burst setup overhead.
+
+### Changes
+- **[maxpool.cpp](HLS/HLS_MaxPool/maxpool.cpp)**: Replaced two separate row buffers (`rowBuf0[256]`, `rowBuf1[256]`) with a single combined buffer (`rowBuf[512]`). The two-row read is now a single loop of `2 * width` iterations reading contiguous memory. The compute phase accesses row 0 at `rowBuf[c2]` and row 1 at `rowBuf[width + c2]`.
+
+### Results
+| Layer | Before (ms) | After (ms) | Change |
+|-------|-------------|------------|--------|
+| MaxPool 0 (32ch, 254×254) | 40.3 | 39.0 | -3.2% |
+| MaxPool 1 (64ch, 125×125) | 21.4 | 20.3 | -5.1% |
+| MaxPool 2 (128ch, 60×60) | 12.1 | 10.9 | -9.9% |
+| MaxPool 3 (256ch, 28×28) | 7.3 | 6.2 | -15.1% |
+| MaxPool 4 (64ch, 12×12) | 0.6 | 0.4 | -33.3% |
+| **Total MaxPool** | **82** | **77** | **-6.1%** |
+| **Total inference** | **744** | **739** | **-0.7%** |
+
+Smaller layers saw the largest relative improvement because burst setup overhead is a larger fraction of the total transfer time when fewer elements are read per burst. The overall impact is marginal because MaxPool is only ~10% of total inference time.
+
+### Current bottleneck breakdown
+- **Conv (HW): 69.4%** (0.512s)
+- **Dense (SW): 20.2%** (0.149s)
+- **MaxPool (HW): 10.4%** (0.077s)
+- Flatten + Sigmoid: ~0.1%
+
+MaxPool is now at diminishing returns — even eliminating it entirely would only save 0.077s. The dominant bottlenecks are Conv (at DSP/BRAM limits on the xc7z020) and Dense (running in software on the ARM CPU).
+
+Runtime HW with MaxPool merged burst reads:
+
+xilinx@pynq:~/dogs_cats$ sudo ./cnnSolver dog.9499.jpg.rgba.planar
+[HW] Opening Conv2D accelerator at 0x40000000...
+[HW] Accelerator opened successfully.
+[HW] Opening MaxPool accelerator at 0x40010000...
+[HW] MaxPool accelerator opened successfully.
+[HW] Allocating DMA-compatible buffers...
+[HW] DMA buffers allocated.
+[HW] Running inference with Conv2D accelerator...
+[HW] OUTPUT: 0.93905449 --> DOG
+Conv 0 (HW) --> 73983754 ns (0.074 s)
+Conv 1 (HW) --> 145554249 ns (0.146 s)
+Conv 2 (HW) --> 132661283 ns (0.133 s)
+Conv 3 (HW) --> 137966246 ns (0.138 s)
+Conv 4 (HW) --> 22144372 ns (0.022 s)
+MaxPool 0 --> 39030926 ns (0.039 s)
+MaxPool 1 --> 20305917 ns (0.020 s)
+MaxPool 2 --> 10880117 ns (0.011 s)
+MaxPool 3 --> 6168662 ns (0.006 s)
+MaxPool 4 --> 444911 ns (0.000 s)
+Dense 5 (SW) --> 148907560 ns (0.149 s)
+Dense 6 (SW) --> 65994 ns (0.000 s)
+Total Conv time (HW): 512309904 ns (0.512 s) 69.4 %
+Total MaxPool time:   76830533 ns (0.077 s) 10.4 %
+Total Dense time (SW):148973554 ns (0.149 s) 20.2 %
+Total Flatten time:   451895 ns (0.000 s) 0.1 %
+Total Sigmoid time:   144701 ns (0.000 s) 0.0 %
+Total time:           738710587 ns (0.739 s) 100.0 %
+
+## Summary of All Files Modified
+
+### HLS Source Files
+- **[HLS/HLS_Conv/conv2d.cpp](HLS/HLS_Conv/conv2d.cpp)** — Conv2D HLS accelerator. Optimizations applied: dual AXI ports, interface tuning, filter caching, input row caching (4-buffer prefetch), 16× filter parallelism, output row buffering, loop flattening, interleaved filter loading, 2× x-position parallelism.
+- **[HLS/HLS_Conv/conv2d.h](HLS/HLS_Conv/conv2d.h)** — Conv2D HLS header. Fixed-point type definitions, function signature with default parameters.
+- **[HLS/HLS_MaxPool/maxpool.cpp](HLS/HLS_MaxPool/maxpool.cpp)** — MaxPool HLS accelerator. 2×2 max pooling with stride 2, separate AXI read/write ports, merged burst row reads, output row buffering.
+- **[HLS/HLS_MaxPool/maxpool.h](HLS/HLS_MaxPool/maxpool.h)** — MaxPool HLS header.
+
+### HLS Synthesis Scripts
+- **[HLS/Scripts/Conv2D_HW_HLS_impl.tcl](HLS/Scripts/Conv2D_HW_HLS_impl.tcl)** — Conv2D HLS synthesis and IP export script.
+- **[HLS/Scripts/MaxPool_HW_HLS_impl.tcl](HLS/Scripts/MaxPool_HW_HLS_impl.tcl)** — MaxPool HLS synthesis and IP export script. Targets xc7z020, 10ns clock, exports to `IP-repo/MaxPool_HW.zip`.
+
+### Vivado Scripts
+- **[Vivado/Scripts/Conv2D_HW_Vivado.tcl](Vivado/Scripts/Conv2D_HW_Vivado.tcl)** — Block design creation. Added: MaxPool_HW IP instance, 2 additional AXI interconnects (for MaxPool gmem0→HP2, gmem1→HP3), expanded peripheral interconnect to 2 master ports (M00 for Conv2D, M01 for MaxPool), IP repo paths updated to reference per-IP subdirectories.
+- **[Vivado/Scripts/Conv2D_HW_Vivado_impl.tcl](Vivado/Scripts/Conv2D_HW_Vivado_impl.tcl)** — Vivado synthesis and implementation script (unchanged).
+
+### Software Source Files
+- **[Solution/src/CAccelProxy.hpp](Solution/src/CAccelProxy.hpp)** — Base accelerator proxy. Added `sharedDMAProxy` pointer and `ShareDMAMappings()` method to allow one proxy to look up DMA address translations from another without copying (avoids double-free).
+- **[Solution/src/CAccelProxy.cpp](Solution/src/CAccelProxy.cpp)** — Updated constructor to initialize `sharedDMAProxy = NULL`. Updated `GetDMAPhysicalAddr()` to fall back to the shared proxy's mapping table when the address is not in the local map.
+- **[Solution/src/CConv2DProxy.hpp](Solution/src/CConv2DProxy.hpp)** — Conv2D proxy header (unchanged).
+- **[Solution/src/CConv2DProxy.cpp](Solution/src/CConv2DProxy.cpp)** — Conv2D proxy implementation (unchanged).
+- **[Solution/src/CMaxPoolProxy.hpp](Solution/src/CMaxPoolProxy.hpp)** — MaxPool proxy header. Register struct matching HLS-generated offsets (control at 0x00, input_r at 0x10, output_r at 0x18, channels at 0x20, width at 0x28, height at 0x30). Base address 0x40010000.
+- **[Solution/src/CMaxPoolProxy.cpp](Solution/src/CMaxPoolProxy.cpp)** — MaxPool proxy implementation. Translates virtual→physical addresses, writes registers, starts accelerator, polls for completion.
+- **[Solution/src/model.h](Solution/src/model.h)** — Added `#include "CMaxPoolProxy.hpp"`. Updated `Inference()` signature to accept `CMaxPoolProxy& maxpooler`.
+- **[Solution/src/model.cpp](Solution/src/model.cpp)** — Updated `Inference()` to accept `CMaxPoolProxy& maxpooler`. Replaced all 5 software `MaxPool()` calls with `maxpooler.MaxPool_HW()`.
+- **[Solution/src/cnnSolver.cpp](Solution/src/cnnSolver.cpp)** — Added MaxPool proxy initialization at 0x40010000. Added `maxpooler.ShareDMAMappings(convolver)` after buffer allocation. Passed `maxpooler` to `Inference()`.
+- **[Solution/src/cnn.h](Solution/src/cnn.h)** — CNN function declarations (unchanged).
+- **[Solution/src/cnn.cpp](Solution/src/cnn.cpp)** — CNN function implementations including software MaxPool, Dense, Flatten, ReLU, Sigmoid (unchanged — software MaxPool kept for reference).
+
+### Build Files
+- **[Makefile](Makefile)** — Top-level Makefile. Added `ip_conv` and `ip_maxpool` targets. `make ip` now builds both. `vivado_project` unzips both IPs into separate subdirectories. Clean targets updated to remove MaxPool HLS project and IP.
+- **[Solution/Makefile](Solution/Makefile)** — Software Makefile. Added `CMaxPoolProxy.o` to compile and link targets.
+
 ### Final performance summary
-Overall speedup from the original software-only baseline: **28.0s → 1.116s = 25.1×**
-Overall speedup from the initial HW accelerator: **86.4s → 1.116s = 77.4×**
+Overall speedup from the original software-only baseline: **28.0s → 0.739s = 37.9×**
+Overall speedup from the initial HW accelerator: **86.4s → 0.739s = 116.9×**

@@ -34,6 +34,11 @@ int main(int argc, char ** argv)
   convolver.Open(CONV2D_HW_ADDR, MAP_SIZE);
   printf("[HW] Accelerator opened successfully.\n");
 
+  printf("[HW] Opening MaxPool accelerator at 0x%08X...\n", MAXPOOL_HW_ADDR);
+  CMaxPoolProxy maxpooler;
+  maxpooler.Open(MAXPOOL_HW_ADDR, MAP_SIZE);
+  printf("[HW] MaxPool accelerator opened successfully.\n");
+
   printf("[HW] Allocating DMA-compatible buffers...\n");
   inputImageFxp = (TFXP*)convolver.AllocDMACompatible(INPUT_SIZE * sizeof(TFXP));
   buffer0       = (TFXP*)convolver.AllocDMACompatible(4129024 * sizeof(TFXP));
@@ -43,6 +48,10 @@ int main(int argc, char ** argv)
     return -1;
   }
   printf("[HW] DMA buffers allocated.\n");
+
+  // Share Conv2D's DMA address mappings with MaxPool so it can translate
+  // the same virtual addresses to physical addresses for its AXI ports.
+  maxpooler.ShareDMAMappings(convolver);
 
   if (!LoadModelInFxP(weights, biases, convolver)) {
     printf("Error loading the CNN model and converting to FxP!\n");
@@ -64,7 +73,7 @@ int main(int argc, char ** argv)
 
   InitTimes(times);
   printf("[HW] Running inference with Conv2D accelerator...\n");
-  TFXP finalPrediction = Inference(inputImageFxp, buffer0, buffer1, weights, biases, times, convolver);
+  TFXP finalPrediction = Inference(inputImageFxp, buffer0, buffer1, weights, biases, times, convolver, maxpooler);
   printf("[HW] OUTPUT: %0.8lf --> %s\n", Fxp2Float(finalPrediction, DECIMALS),
     Fxp2Float(finalPrediction) < 0.5 ? "CAT" : "DOG");
   PrintTimes(times, NUM_LAYERS);

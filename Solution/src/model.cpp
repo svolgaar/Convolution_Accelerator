@@ -195,7 +195,7 @@ bool LoadImageInFxp(const char * fileName, TFXP * inputImageFxp, uint8_t * input
   return true;
 }
 
-TFXP Inference(TFXP * inputImageFxp, TFXP * buffer0, TFXP * buffer1, TFXP ** fxpWeights, TFXP ** fxpBiases, TTimes & times, CConv2DProxy& convolver)
+TFXP Inference(TFXP * inputImageFxp, TFXP * buffer0, TFXP * buffer1, TFXP ** fxpWeights, TFXP ** fxpBiases, TTimes & times, CConv2DProxy& convolver, CMaxPoolProxy& maxpooler)
 {
   uint32_t iLayer, size;
   struct timespec start, end;
@@ -207,7 +207,7 @@ TFXP Inference(TFXP * inputImageFxp, TFXP * buffer0, TFXP * buffer1, TFXP ** fxp
   clock_gettime(CLOCK_MONOTONIC_RAW, &end);
   times.timeConv[iLayer] = CalcTimeDiff(end, start);
   clock_gettime(CLOCK_MONOTONIC_RAW, &start);
-  MaxPool(buffer0, buffer1, LayerShapes[iLayer][1], size, size);
+  maxpooler.MaxPool_HW(buffer0, buffer1, LayerShapes[iLayer][1], size, size);
   clock_gettime(CLOCK_MONOTONIC_RAW, &end);
   times.timeMaxPool[iLayer] = CalcTimeDiff(end, start);
   ++ iLayer;
@@ -219,7 +219,7 @@ TFXP Inference(TFXP * inputImageFxp, TFXP * buffer0, TFXP * buffer1, TFXP ** fxp
   clock_gettime(CLOCK_MONOTONIC_RAW, &end);
   times.timeConv[iLayer] = CalcTimeDiff(end, start);
   clock_gettime(CLOCK_MONOTONIC_RAW, &start);
-  MaxPool(buffer0, buffer1, LayerShapes[iLayer][1], size, size);
+  maxpooler.MaxPool_HW(buffer0, buffer1, LayerShapes[iLayer][1], size, size);
   clock_gettime(CLOCK_MONOTONIC_RAW, &end);
   times.timeMaxPool[iLayer] = CalcTimeDiff(end, start);
   ++ iLayer;
@@ -231,7 +231,7 @@ TFXP Inference(TFXP * inputImageFxp, TFXP * buffer0, TFXP * buffer1, TFXP ** fxp
   clock_gettime(CLOCK_MONOTONIC_RAW, &end);
   times.timeConv[iLayer] = CalcTimeDiff(end, start);
   clock_gettime(CLOCK_MONOTONIC_RAW, &start);
-  MaxPool(buffer0, buffer1, LayerShapes[iLayer][1], size, size);
+  maxpooler.MaxPool_HW(buffer0, buffer1, LayerShapes[iLayer][1], size, size);
   clock_gettime(CLOCK_MONOTONIC_RAW, &end);
   times.timeMaxPool[iLayer] = CalcTimeDiff(end, start);
   ++ iLayer;
@@ -243,7 +243,7 @@ TFXP Inference(TFXP * inputImageFxp, TFXP * buffer0, TFXP * buffer1, TFXP ** fxp
   clock_gettime(CLOCK_MONOTONIC_RAW, &end);
   times.timeConv[iLayer] = CalcTimeDiff(end, start);
   clock_gettime(CLOCK_MONOTONIC_RAW, &start);
-  MaxPool(buffer0, buffer1, LayerShapes[iLayer][1], size, size);
+  maxpooler.MaxPool_HW(buffer0, buffer1, LayerShapes[iLayer][1], size, size);
   clock_gettime(CLOCK_MONOTONIC_RAW, &end);
   times.timeMaxPool[iLayer] = CalcTimeDiff(end, start);
   ++ iLayer;
@@ -255,7 +255,7 @@ TFXP Inference(TFXP * inputImageFxp, TFXP * buffer0, TFXP * buffer1, TFXP ** fxp
   clock_gettime(CLOCK_MONOTONIC_RAW, &end);
   times.timeConv[iLayer] = CalcTimeDiff(end, start);
   clock_gettime(CLOCK_MONOTONIC_RAW, &start);
-  MaxPool(buffer0, buffer1, LayerShapes[iLayer][1], size, size);
+  maxpooler.MaxPool_HW(buffer0, buffer1, LayerShapes[iLayer][1], size, size);
   clock_gettime(CLOCK_MONOTONIC_RAW, &end);
   times.timeMaxPool[iLayer] = CalcTimeDiff(end, start);
 

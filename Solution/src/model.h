@@ -3,6 +3,7 @@
 #include <map>
 #include "CAccelProxy.hpp"
 #include "CConv2DProxy.hpp"
+#include "CMaxPoolProxy.hpp"
 
 
 const uint32_t DECIMALS = 20;
@@ -38,7 +39,7 @@ void FreeParams(const uint32_t numLayers, void ** params, CConv2DProxy * convolv
 
 bool LoadModelInFxP(TFXP ** fxpWeights, TFXP ** fxpBiases, CConv2DProxy& convolver);
 bool LoadImageInFxp(const char * fileName, TFXP * inputImageFxp, uint8_t * inputImageRGB, uint32_t inputSize);
-TFXP Inference(TFXP * inputImageFxp, TFXP * buffer0, TFXP * buffer1, TFXP ** fxpWeights, TFXP ** fxpBiases, TTimes & times, CConv2DProxy& convolver);
+TFXP Inference(TFXP * inputImageFxp, TFXP * buffer0, TFXP * buffer1, TFXP ** fxpWeights, TFXP ** fxpBiases, TTimes & times, CConv2DProxy& convolver, CMaxPoolProxy& maxpooler);
 
 inline TFXP Float2Fxp(float value, uint32_t decimalBits = DECIMALS)
 {

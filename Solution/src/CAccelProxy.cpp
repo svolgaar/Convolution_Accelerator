@@ -12,7 +12,7 @@ extern "C" {
 ///////////////////////////////////////////////////////////////////////////////
 
 CAccelProxy::CAccelProxy(bool Logging)
-  : accelRegs(NULL), baseAddr(0), mappingSize(0), logging(Logging)
+  : accelRegs(NULL), baseAddr(0), mappingSize(0), logging(Logging), sharedDMAProxy(NULL)
 {
   if (logging)
     printf("CAccelProxy::CAccelProxy()\n");
@@ -145,13 +145,16 @@ uint32_t CAccelProxy::GetDMAPhysicalAddr(void * VirtAddr)
   if (logging)
     printf("CAccelProxy::GetDMAPhysicalAddr(Addr = 0x%08X)\n", (uint32_t)VirtAddr);
 
-  if (dmaMappings.count((uint32_t)VirtAddr) == 0) {
-    if (logging)
-      printf("No virtual address 0x%08X present in the dictionary of mappings.\n", (uint32_t)VirtAddr);
-    return 0;
-  }
-  
-  return dmaMappings[(uint32_t)VirtAddr];
+  if (dmaMappings.count((uint32_t)VirtAddr) != 0)
+    return dmaMappings[(uint32_t)VirtAddr];
+
+  // Fall back to shared proxy's mappings if available
+  if (sharedDMAProxy != NULL && sharedDMAProxy->dmaMappings.count((uint32_t)VirtAddr) != 0)
+    return sharedDMAProxy->dmaMappings.at((uint32_t)VirtAddr);
+
+  if (logging)
+    printf("No virtual address 0x%08X present in the dictionary of mappings.\n", (uint32_t)VirtAddr);
+  return 0;
 }
 
 
