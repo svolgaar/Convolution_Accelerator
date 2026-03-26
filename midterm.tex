@@ -1,0 +1,240 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{float}
+\usepackage{microtype}
+
+\hypersetup{colorlinks=true, linkcolor=blue!70!black}
+
+\title{\textbf{Design and Optimization of an Accelerator\\
+for a CNN}\\[0.4em]
+\large HW-SW Codesign --- Midterm Report}
+\author{Hugo Svolgaard}
+\date{Due: 2026-04-02\null}
+
+\begin{document}
+
+\maketitle
+
+%% ============================================================
+\section*{Network Overview}
+%% ============================================================
+
+The application runs a 5-layer CNN (256$\times$256 RGB input) through 5 sequential
+Conv2D $\to$ MaxPool pairs followed by 2 dense layers.
+Input data is stored in CHW layout (Channel $\times$ Height $\times$ Width).
+Each conv layer's input channel count equals the previous layer's filter count;
+the first layer starts from 3 (RGB).
+
+\begin{center}
+\begin{tabular}{ccccc}
+\toprule
+Layer & $C_i$ & $C_o$ & Input & Output \\
+\midrule
+0 & 3   & 32  & 256$\times$256 & 254$\times$254 \\
+1 & 32  & 64  & 127$\times$127 & 125$\times$125 \\
+2 & 64  & 128 & 62$\times$62   & 60$\times$60   \\
+3 & 128 & 256 & 30$\times$30   & 28$\times$28   \\
+4 & 256 & 64  & 14$\times$14   & 12$\times$12   \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%% ============================================================
+\section{Step 1: Basic Accelerator --- Bias and ReLU in Hardware}
+%% ============================================================
+
+The HLS accelerator \texttt{Conv2D\_HW} mirrors the software 6-nested-loop structure.
+Ports are exposed via \texttt{m\_axi} (Master AXI, bulk DDR transfers) and
+\texttt{s\_axilite} (Slave AXI-Lite, scalar parameters and base addresses).
+Pointer arguments appear on both: \texttt{s\_axilite} provides the runtime base
+address; \texttt{m\_axi} with \texttt{offset=slave} performs the actual transfer from
+that address. \texttt{input}/\texttt{output} and \texttt{filters}/\texttt{biases} are
+split across two AXI master bundles (HP0 and HP1) so the inner loop can read a filter
+coefficient and an input pixel simultaneously, achieving II=1.
+
+\noindent In the software version, bias addition and ReLU are separate post-processing passes
+over the full output tensor, each requiring an additional DDR read/write. In the
+hardware version, both are folded directly into the accumulation step, eliminating
+those extra passes entirely. ReLU is parameterised so the same accelerator handles
+all conv layers (ReLU=1) and the final dense layer (ReLU=0).
+
+%% ============================================================
+\section{Step 2: Caching of Filter Coefficients}
+%% ============================================================
+
+In the minimal implementation, all $C_i \times 9$ filter coefficients are re-fetched
+from DDR on every MAC operation (\mbox{outH $\times$ outW} times per filter).
+The fix: copy the full filter into a local BRAM array (\texttt{localFilters[256*9]})
+once before the spatial loops, using a pipelined sequential loop (II=1) that HLS
+can infer as a single AXI burst. All subsequent MAC reads come from BRAM (1-cycle latency).
+DDR filter reads drop from $N_f \times H \times W \times C_i \times 9$
+to $N_f \times C_i \times 9$. The array is reused (overwritten) for each filter;
+2304 elements covers the largest case (layer 4: $256 \times 9$).
+
+\noindent AXI burst parameters were also tuned: \texttt{max\_read\_burst\_length=256} raises
+throughput from 64 to 1024 bytes per burst; \texttt{num\_read\_outstanding=16} allows
+16 requests in flight simultaneously, hiding DDR latency.
+
+%% ============================================================
+\section{Step 3: Caching of Input Rows}
+%% ============================================================
+
+The 3$\times$3 kernel requires 3 consecutive input rows per output row.
+When the y-loop advances by 1, two of those rows overlap with the previous iteration
+--- only 1 new row needs loading from DDR\@.
+Three row buffers (\texttt{rowBuffer[3][4096]}, each holding $C_i \times W_{in}$
+values) form a circular buffer. After the initial 3-row load, each y-iteration fetches
+exactly 1 new row into the expired slot (\texttt{newRow \% 3}).
+
+\noindent \texttt{\#pragma HLS LOOP\_FLATTEN off} is applied to the row-loading nested loops.
+Without it, HLS merges the channel and pixel loops into a single flattened pipeline;
+the resulting combined address computation (large inter-channel strides in CHW layout)
+lengthens the critical path beyond the 10\,ns clock period, causing negative timing slack.
+Keeping the loops separate costs a few cycles per channel boundary but preserves timing
+closure.
+
+%% ============================================================
+\section{Step 4: Parallelising Output Filters}
+%% ============================================================
+
+For any given input pixel, computing it against $N$ output filters simultaneously
+is fully independent: each filter reads the same pixel but multiplies by different
+coefficients. The solution replicates the MAC hardware $N$ times:
+
+\begin{itemize}
+  \item \texttt{localFilters[N][256*9]}: N separate BRAM arrays;
+        \texttt{ARRAY\_PARTITION complete dim=1} gives each a physically independent
+        block so all N can be read in the same cycle.
+  \item The inner \texttt{p} loop is \texttt{UNROLL}ed, instantiating N multipliers.
+  \item Filter loading is restructured to interleaved (outer index \texttt{i},
+        inner unrolled \texttt{p}): all N BRAMs are written simultaneously from
+        a single sequential DDR read stream, eliminating N separate burst restarts.
+  \item \texttt{nActive} guards the last group when \texttt{numFilters \% N $\neq$ 0}.
+\end{itemize}
+
+\noindent With N=16 and the inner loop reading one pixel and 16 filter values per cycle,
+output writes to 16 scattered DDR planes became the bottleneck
+(Conv 0 had only 27 MACs per pixel but 16 write transactions).
+An \textbf{output row buffer} (\texttt{outRowBuf[16][256]}) accumulates one full row
+per filter in BRAM, then burst-writes each row to DDR, converting 16 scattered
+writes per pixel into 16 sequential bursts per output row. This alone gave a
+7.2$\times$ speedup on Conv 0.
+
+\noindent The \texttt{latency=20} AXI hint (which caused pessimistic pipeline bubbles) was
+also removed, allowing HLS to schedule transactions more aggressively.
+
+%% ============================================================
+\section{Step 5 (Optional): Row Reuse and Overlapping Transfers}
+%% ============================================================
+
+\subsection*{5a: 4-Buffer Prefetch}
+
+With 3 row buffers, the slot for the next prefetch (\texttt{(y+3)\%3}) collides
+with the current computation slot (\texttt{y\%3}), forcing them to serialise.
+A 4th buffer resolves the collision: \texttt{(y+3)\%4} is always different from
+\texttt{y\%4}, \texttt{(y+1)\%4}, \texttt{(y+2)\%4}.
+An additional benefit: \texttt{\%4} is a 2-bit mask in hardware vs.\ a full
+division circuit for \texttt{\%3}, reducing the compute pipeline iteration latency
+from 43 to 11 cycles (II=1 maintained).
+
+\subsection*{5b: 2$\times$ X-position Parallelism}
+
+Adjacent output x-positions share the \emph{same} filter coefficient
+(filter address depends on \texttt{(ch,cy,cx)}, not \texttt{x}).
+The x-loop steps by 2 with dual accumulators (\texttt{acc0}, \texttt{acc1}),
+reading two adjacent input pixels and one filter value per cycle --- doubling MAC
+throughput without extra filter BRAM.
+\texttt{rowBuffer} and \texttt{outRowBuf} are partitioned \texttt{cyclic factor=2 dim=2}
+so adjacent addresses land in different BRAM banks, enabling conflict-free parallel reads/writes.
+DSP utilisation rose from 41\% to 63\%.
+
+\subsection*{Negative slack fix}
+
+Loop-flattening (removing \texttt{LOOP\_FLATTEN off}) was tried to reduce
+per-channel burst restart overhead but caused negative timing slack.
+\texttt{LOOP\_FLATTEN off} was re-applied selectively to the row-loading and
+output-write loops while keeping the interleaved filter-loading structure.
+
+%% ============================================================
+\section{Bonus: MaxPool Hardware Accelerator}
+%% ============================================================
+
+After all Conv2D optimisations, Conv and MaxPool were equally bottlenecked (43.5\%
+and 43.1\% of runtime respectively). MaxPool 2$\times$2 with stride 2 requires only
+comparisons (zero DSPs), making it ideal for a lightweight accelerator.
+
+\noindent The HLS design reads two consecutive rows in a single burst (they are contiguous in
+CHW layout), applies a comparison tree at II=1, and burst-writes the output row.
+Two additional HP ports (HP2, HP3) handle MaxPool input/output independently from the
+Conv2D ports. The software proxy \texttt{CMaxPoolProxy} reuses Conv2D's DMA address
+translation table via \texttt{ShareDMAMappings} () to avoid a double-free.
+
+%% ============================================================
+\section{Results}
+%% ============================================================
+
+Resource cost:
+\[
+  C_R = \frac{25}{140}\cdot\#\text{BRAMs}
+      + \frac{25}{220}\cdot\#\text{DSPs}
+      + \frac{25}{53200}\cdot\#\text{LUTs}
+      + \frac{25}{106400}\cdot\#\text{FFs}
+\]
+
+\begin{table}[H]
+\centering
+\small
+\setlength{\tabcolsep}{5pt}
+\begin{tabular}{p{5.8cm}rrrrrrrr}
+\toprule
+\textbf{Description} & \textbf{Time (ms)} & \textbf{MHz} & \textbf{LUTs} & \textbf{FFs} & \textbf{BRAMs} & \textbf{DSPs} & \textbf{$C_R$} & \textbf{Pareto?} \\
+\midrule
+SW only (ARM)                       & 28000 & n/a & n/a   & n/a   & n/a & n/a & 0     & Yes \\
+Initial HW                          & 86357 & 100 & 5316  & 5838  & 0   & 39  & 9.11  & No  \\
++ Dual AXI + Filter cache           & 14124 & 100 & 9180  & 5977  & 8   & 30  & 11.26 & No  \\
++ Input row caching                 & 12870 & 100 & 10369 & 6494  & 40  & 15  & 12.87 & No  \\
++ N=4 filter parallelism            & 4853  & 100 & 15986 & 12978 & 64  & 66  & 22.97 & No  \\
++ N=8 filter parallelism            & 3374  & 100 & 19224 & 15686 & 96  & 88  & 30.58 & No  \\
++ 4-buffer prefetch                 & 3190  & 100 & 17117 & 12607 & 96  & 88  & 28.74 & No  \\
++ N=16 + output row buffering       & 1402  & 100 & 17099 & 13367 & 176 & 91  & 42.09 & No  \\
++ Loop flatten + interleaved load   & 1397  & 100 & 16976 & 20575 & 176 & 92  & 43.22 & No  \\
++ 2$\times$ x-position parallelism  & 1116  & 100 & 24920 & 20913 & 192 & 140 & 51.18 & No  \\
++ MaxPool HW accelerator (initial)  & 744   & 100 & n/a   & n/a   & n/a & n/a & n/a   & n/a \\
+\midrule
+\textbf{Final: Conv2D (N=16, 2x x-par.) + MaxPool HW (merged burst)} & \textbf{739} & 100 & n/a & n/a & n/a & n/a & n/a & n/a \\
+\bottomrule
+\end{tabular}
+\caption{Execution time and resource usage per solution (256$\times$256 input, layer 0: $C_i$=3, $C_o$=32).
+% TODO: Pareto optimal analysis
+% A solution is Pareto-optimal if no other solution achieves both strictly lower time AND
+% strictly lower cost C_R. Fill in the Pareto? column based on Time vs C_R tradeoff.
+% Plot Time (ms) vs C_R to identify the Pareto frontier.
+}
+\end{table}
+
+\noindent The final solution accelerates all 5 Conv2D and all 5 MaxPool layers on the FPGA.
+The remaining bottleneck is the 2 dense layers running in software on the ARM CPU (20\% of runtime).
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lrr}
+\toprule
+\textbf{Component} & \textbf{Time (ms)} & \textbf{\% of total} \\
+\midrule
+Conv2D (5 layers, HW)  & 512  & 69.3\% \\
+MaxPool (5 layers, HW) & 77   & 10.4\% \\
+Dense (2 layers, SW)   & 149  & 20.2\% \\
+Flatten + Sigmoid      & 1    & 0.1\%  \\
+\midrule
+\textbf{Total}         & \textbf{739} & 100\% \\
+\bottomrule
+\end{tabular}
+\caption{Final solution runtime breakdown. Overall speedup vs.\ software-only: \textbf{37.9$\times$} (28.0\,s to 0.739\,s).}
+\end{table}
+
+\end{document}
