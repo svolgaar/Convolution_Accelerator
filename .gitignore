@@ -1,8 +1,32 @@
 # Vitis HLS build output
 Conv2D_HW_HLS/
+MaxPool_HW_HLS/
 
-# Generated IP
-IP-repo/
+# Vivado build output
+Conv2D_HW_Vivado/
 
-# Log files
+# Generated IP (unzipped)
+IP-repo/Conv2D_HW/
+IP-repo/MaxPool_HW/
+IP-repo/component.xml
+IP-repo/constraints/
+IP-repo/doc/
+IP-repo/drivers/
+IP-repo/hdl/
+IP-repo/misc/
+IP-repo/xgui/
+
+# Log and temp files
 vitis_hls.log
+vivado*.log
+vivado*.jou
+vivado*.str
+*.ltx
+NA/
+.Xil/
+Conv2D_HW_Vivado_def_val.txt
+Conv2D_HW_Vivado_dump.txt
+
+# Keep final bitstream and hardware handoff
+!Conv2D_HW.bit
+!Conv2D_HW.hwh

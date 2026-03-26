@@ -71,8 +71,9 @@ Produces `cnnSolver` binary (cross-compiled for ARM).
 
 Copy to the board:
 ```bash
-scp Solution/cnnSolver xilinx@<board-ip>:~/dogs_cats/
-scp <bitstream>.bit     xilinx@<board-ip>:~/dogs_cats/
+scp Solution xilinx@<board-ip>:~
+scp <bitstream>.bit     xilinx@<board-ip>:~
+scp <bitstream>.bit     xilinx@<board-ip>:~
 ```
 
 Program the FPGA and run:
@@ -80,15 +81,11 @@ Program the FPGA and run:
 sudo fpgautil -b <bitstream>.bit
 sudo ./cnnSolver <image>.rgba.planar
 ```
-
-Input images must be in `.rgba.planar` format (raw 256×256 RGBA, channel-planar).
-
 ### 5. Clean
 
 ```bash
 make clean          # remove HLS projects and IPs
-cd Solution && make clean
-```
+
 
 ## Performance Summary
 
